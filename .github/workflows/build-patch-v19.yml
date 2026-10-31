@@ -1,0 +1,262 @@
+name: Build Karaoke Patch (from source)
+
+# Manual trigger only — nothing builds on push, per the owner's
+# build-cadence rule (no builds without an explicit ask).
+#
+# This workflow builds the patch bundle ENTIRELY from source:
+#   kotlinc -> Kotlin patch classes.dex
+#   javac   -> extension classes -> d8 -> extensions/karaoke.rve
+#   zip     -> karaoke-patches-v<version>.rvp
+# There is NO repack base. The old smali workflow (build-patch.yml,
+# deleted 2026-10-31) rebuilt from a stale v15 .rvp and discarded
+# source work; the old v19 workflow shipped the v13-era Kotlin dex
+# from that same base. Both failure modes are gone: every byte of
+# the bundle is compiled here, and the run FAILS if any verification
+# step below fails.
+#
+# The bundle is uploaded as a workflow artifact. It is NEVER
+# committed or pushed to main — a human attaches the .rvp to a
+# GitHub Release. permissions is contents: read for that reason.
+#
+# Pinned toolchain (verified 2026-10-31):
+# - Kotlin 2.2.21, NOT 2.3.0. The kotlinc recipe below reproduces
+#   the v14 classes.dex byte-identically with 2.2.21
+#   (md5 4e25db7af92e7d76093c75360e715342, 29,908 B). A different
+#   compiler version produces different bytecode, so the version
+#   AND the SHA-256 below are both pinned. Do not bump either
+#   without re-running the local byte-identity check first.
+# - Android SDK: platforms;android-35 + build-tools;35.0.0
+#   (android.jar = API 35, d8 from build-tools 35.0.0, no --min-api).
+# - ReVance CLI 6.0.0, SHA-256 verified against the official
+#   GitHub release asset.
+# - All third-party actions are SHA-pinned (see the # vN comments).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Bundle version (e.g. 1.0.0)'
+        required: true
+        default: '1.0.0'
+      stock_apk_url:
+        description: 'Optional stock YouTube 20.40.45 base APK URL for a full CLI patch-run check (leave empty to skip)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install Android SDK (API 35, pinned)
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - name: Install pinned SDK packages
+        run: |
+          set -e
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          ANDROID_JAR="$ANDROID_HOME/platforms/android-35/android.jar"
+          D8="$ANDROID_HOME/build-tools/35.0.0/d8"
+          DEXDUMP="$ANDROID_HOME/build-tools/35.0.0/dexdump"
+          test -f "$ANDROID_JAR" || { echo "android.jar (API 35) not found"; exit 1; }
+          test -x "$D8" || { echo "d8 (build-tools 35.0.0) not found"; exit 1; }
+          test -x "$DEXDUMP" || { echo "dexdump (build-tools 35.0.0) not found"; exit 1; }
+          echo "ANDROID_JAR=$ANDROID_JAR" >> "$GITHUB_ENV"
+          echo "D8=$D8" >> "$GITHUB_ENV"
+          echo "DEXDUMP=$DEXDUMP" >> "$GITHUB_ENV"
+          "$D8" --version
+
+      - name: Install Kotlin 2.2.21 + ReVance CLI 6.0.0 (SHA-256 checked)
+        run: |
+          set -e
+          mkdir -p /tmp/tools
+          KOTLINC_VER=2.2.21
+          KOTLINC_SHA256=a623871f1cd9c938946948b70ef9170879f0758043885bbd30c32f024e511714
+          curl -L -o /tmp/kotlin.zip "https://github.com/JetBrains/kotlin/releases/download/v${KOTLINC_VER}/kotlin-compiler-${KOTLINC_VER}.zip"
+          echo "${KOTLINC_SHA256}  /tmp/kotlin.zip" | sha256sum -c -
+          unzip -q /tmp/kotlin.zip -d /opt
+          echo "/opt/kotlinc/bin" >> "$GITHUB_PATH"
+          /opt/kotlinc/bin/kotlinc -version
+          CLI_SHA256=c25549bc17d59d2eb94fa5f86e60e9b77a02772ca88f7050f8f1276f923a9958
+          curl -L -o /tmp/tools/revanced-cli-6.0.0-all.jar "https://github.com/ReVanced/revanced-cli/releases/download/v6.0.0/revanced-cli-6.0.0-all.jar"
+          echo "${CLI_SHA256}  /tmp/tools/revanced-cli-6.0.0-all.jar" | sha256sum -c -
+          echo "CLI_JAR=/tmp/tools/revanced-cli-6.0.0-all.jar" >> "$GITHUB_ENV"
+          ls -lh /tmp/tools/revanced-cli-6.0.0-all.jar
+
+      - name: Build Kotlin patch classes (proven recipe)
+        run: |
+          set -e
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          mkdir -p /tmp/build/patch-classes
+          # Proven recipe (2026-10-31): this exact command reproduces
+          # the v14 classes.dex byte-identically from unmodified
+          # source. -Xskip-prerelease-check and -Xcontext-parameters
+          # are required — plain kotlinc fails on the patcher API.
+          /opt/kotlinc/bin/kotlinc -Xskip-prerelease-check -Xcontext-parameters \
+            -jvm-target 17 -cp "$CLI_JAR" \
+            -d /tmp/build/patch-classes \
+            patch/patches/src/main/kotlin/app/karaokenow/patch/KaraokePatch.kt
+          ls /tmp/build/patch-classes/app/karaokenow/patch/
+          test -f /tmp/build/patch-classes/META-INF/main.kotlin_module
+
+      - name: d8 Kotlin dex (twice — determinism check)
+        run: |
+          set -e
+          mkdir -p /tmp/build/dex-patch-a /tmp/build/dex-patch-b
+          "$D8" --lib "$ANDROID_JAR" --debug --output /tmp/build/dex-patch-a \
+            /tmp/build/patch-classes/app/karaokenow/patch/*.class
+          "$D8" --lib "$ANDROID_JAR" --debug --output /tmp/build/dex-patch-b \
+            /tmp/build/patch-classes/app/karaokenow/patch/*.class
+          md5sum /tmp/build/dex-patch-a/classes.dex /tmp/build/dex-patch-b/classes.dex
+          cmp /tmp/build/dex-patch-a/classes.dex /tmp/build/dex-patch-b/classes.dex \
+            || { echo "FATAL: d8 output is not deterministic"; exit 1; }
+          echo "Kotlin classes.dex md5:"
+          md5sum /tmp/build/dex-patch-a/classes.dex
+          # Baseline for reference (unmodified KaraokePatch.kt, v14):
+          # 4e25db7af92e7d76093c75360e715342. A mismatch is EXPECTED
+          # after a real Kotlin source change — it is not a failure.
+          # Determinism (the cmp above) is what must hold.
+
+      - name: Build extension dex (javac + d8, twice — determinism check)
+        run: |
+          set -e
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          mkdir -p /tmp/build/ext-classes /tmp/build/dex-ext-a /tmp/build/dex-ext-b
+          find patch/extension/src/main/java -name "*.java" > /tmp/ext-sources.txt
+          wc -l /tmp/ext-sources.txt
+          javac -encoding UTF-8 -cp "$ANDROID_JAR" -d /tmp/build/ext-classes @/tmp/ext-sources.txt
+          "$D8" --lib "$ANDROID_JAR" --debug --output /tmp/build/dex-ext-a \
+            /tmp/build/ext-classes/app/karaokenow/extension/*.class
+          "$D8" --lib "$ANDROID_JAR" --debug --output /tmp/build/dex-ext-b \
+            /tmp/build/ext-classes/app/karaokenow/extension/*.class
+          md5sum /tmp/build/dex-ext-a/classes.dex /tmp/build/dex-ext-b/classes.dex
+          cmp /tmp/build/dex-ext-a/classes.dex /tmp/build/dex-ext-b/classes.dex \
+            || { echo "FATAL: d8 output is not deterministic"; exit 1; }
+          ls -lh /tmp/build/dex-ext-a/classes.dex
+
+      - name: Assemble bundle (.rvp, from source only)
+        run: |
+          set -e
+          BUNDLE="karaoke-patches-v${{ inputs.version }}.rvp"
+          echo "BUNDLE=$BUNDLE" >> "$GITHUB_ENV"
+          rm -rf /tmp/build/rvp-root
+          mkdir -p /tmp/build/rvp-root/extensions
+          cp /tmp/build/dex-patch-a/classes.dex /tmp/build/rvp-root/classes.dex
+          cp /tmp/build/dex-ext-a/classes.dex /tmp/build/rvp-root/extensions/karaoke.rve
+          mkdir -p /tmp/build/rvp-root/META-INF /tmp/build/rvp-root/app/karaokenow/patch
+          cp /tmp/build/patch-classes/META-INF/main.kotlin_module /tmp/build/rvp-root/META-INF/
+          cp /tmp/build/patch-classes/app/karaokenow/patch/*.class /tmp/build/rvp-root/app/karaokenow/patch/
+          cd /tmp/build/rvp-root
+          zip -r -X "$GITHUB_WORKSPACE/$BUNDLE" classes.dex META-INF app extensions
+          cd "$GITHUB_WORKSPACE"
+          ls -lh "$BUNDLE"
+          unzip -l "$BUNDLE"
+          md5sum "$BUNDLE"
+
+      - name: Verify — CLI loads the bundle
+        run: |
+          set -e
+          java -jar "$CLI_JAR" list-patches -p "$BUNDLE" -b | tee /tmp/list-patches.txt
+          grep -q "Karaoke" /tmp/list-patches.txt || { echo "FATAL: Karaoke patch not listed"; exit 1; }
+          grep -qi "enabled" /tmp/list-patches.txt || { echo "FATAL: Karaoke patch not enabled"; exit 1; }
+
+      - name: "Verify — dex dump: 3 synthetics + extension code, no stub"
+        run: |
+          set -e
+          mkdir -p /tmp/verify
+          unzip -p "$BUNDLE" classes.dex > /tmp/verify/classes.dex
+          unzip -p "$BUNDLE" extensions/karaoke.rve > /tmp/verify/karaoke.rve
+          # Exactly 3 synthetics remain (v1.0.0): patch_getSpeed,
+          # patch_getPosition, patch_getVideoId. The other four
+          # v1 synthetics were deleted 2026-10-31 (zero call sites;
+          # patch_getVolume lied — a() returns speed, not volume).
+          for s in patch_getSpeed patch_getPosition patch_getVideoId; do
+            "$DEXDUMP" -d /tmp/verify/classes.dex | grep -q "$s" \
+              || { echo "FATAL: synthetic $s missing from classes.dex"; exit 1; }
+          done
+          echo "All 3 synthetics present."
+          # The deleted synthetics must be absent, not just unused.
+          for s in patch_getVolume patch_setVolume patch_isPlaying patch_pause patch_resume; do
+            if "$DEXDUMP" -d /tmp/verify/classes.dex | grep -q "$s"; then
+              echo "FATAL: deleted synthetic $s still present in classes.dex"; exit 1
+            fi
+          done
+          echo "Deleted synthetics absent."
+          # Extension dex must contain the bridge; the v7-diag stub must be gone.
+          "$DEXDUMP" -d /tmp/verify/karaoke.rve | grep -q "KaraokeBridge" \
+            || { echo "FATAL: KaraokeBridge missing from karaoke.rve"; exit 1; }
+          if strings /tmp/verify/karaoke.rve | grep -q "setController stubbed"; then
+            echo "FATAL: diag stub present in karaoke.rve"; exit 1
+          fi
+          echo "Extension dex OK."
+
+      - name: Verify — MultiDexIO probe (bundle dexes)
+        run: |
+          set -e
+          # Same probe the local builds use (Probe2 single-dex mode),
+          # compiled here against the CLI jar, which bundles
+          # lanchon.multidexlib2.
+          cat > /tmp/verify/Probe.java <<'EOF'
+          import java.io.File;
+          import lanchon.multidexlib2.MultiDexIO;
+          import lanchon.multidexlib2.BasicDexFileNamer;
+          import com.android.tools.smali.dexlib2.Opcodes;
+          public class Probe {
+              public static void main(String[] args) throws Exception {
+                  Object dex = MultiDexIO.readDexFile(false, new File(args[0]),
+                          new BasicDexFileNamer(), Opcodes.getDefault(), null);
+                  System.out.println("OK: " + dex.getClass().getName() + " <- " + args[0]);
+              }
+          }
+          EOF
+          javac -cp "$CLI_JAR" -d /tmp/verify /tmp/verify/Probe.java
+          java -cp "/tmp/verify:$CLI_JAR" Probe /tmp/verify/classes.dex
+          java -cp "/tmp/verify:$CLI_JAR" Probe /tmp/verify/karaoke.rve
+
+      - name: Verify — full CLI patch run (only if a stock APK URL was given)
+        if: inputs.stock_apk_url != ''
+        run: |
+          set -e
+          curl -L -o /tmp/verify/base.apk "${{ inputs.stock_apk_url }}"
+          ls -lh /tmp/verify/base.apk
+          mkdir -p /tmp/verify/patched
+          java -jar "$CLI_JAR" patch -p "$BUNDLE" -b -o /tmp/verify/patched/patched.apk /tmp/verify/base.apk | tee /tmp/verify/patch-run.log
+          grep -q '"Karaoke" succeeded' /tmp/verify/patch-run.log \
+            || { echo "FATAL: CLI patch run did not report Karaoke succeeded"; exit 1; }
+          test -s /tmp/verify/patched/patched.apk || { echo "FATAL: no patched APK produced"; exit 1; }
+          ls -lh /tmp/verify/patched/patched.apk
+          # MultiDexIO container mode on the patched APK (Probe3 shape).
+          cat > /tmp/verify/ProbeApk.java <<'EOF'
+          import java.io.File;
+          import lanchon.multidexlib2.MultiDexIO;
+          import lanchon.multidexlib2.BasicDexFileNamer;
+          import com.android.tools.smali.dexlib2.Opcodes;
+          public class ProbeApk {
+              public static void main(String[] args) throws Exception {
+                  Object dex = MultiDexIO.readDexFile(true, new File(args[0]),
+                          new BasicDexFileNamer(), Opcodes.getDefault(), null);
+                  System.out.println("OK: " + dex.getClass().getName() + " <- " + args[0]);
+              }
+          }
+          EOF
+          javac -cp "$CLI_JAR" -d /tmp/verify /tmp/verify/ProbeApk.java
+          java -cp "/tmp/verify:$CLI_JAR" ProbeApk /tmp/verify/patched/patched.apk
+          echo "Full CLI patch run + probe OK."
+
+      - name: Upload bundle artifact (no commit, no push)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: karaoke-patches-v${{ inputs.version }}
+          path: karaoke-patches-v${{ inputs.version }}.rvp
+          retention-days: 90
