@@ -1,0 +1,81 @@
+name: Deploy Modal karaoke server
+
+# Manual trigger only — nothing deploys on push, per the owner's
+# build-cadence rule (no builds without an explicit ask).
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install Modal CLI
+        run: pip install "modal==1.6.2" fastapi httpx numpy
+      # NOTE: modal deploy imports modal_app.py locally, so the runner
+      # needs the app's local deps too (fastapi/httpx/numpy) — the Modal
+      # image deps are separate and install on Modal's side.
+      # API-key auth: the server reads KARAOKE_API_KEY from the
+      # "karaoke-api-key" Modal Secret. Create/update that secret
+      # from the repo secret BEFORE deploying, so the deployed
+      # server is keyed. --force overwrites on key rotation. The
+      # key value never appears in this script (only the $VAR
+      # reference) and GitHub masks secret values in logs. If the
+      # repo secret is unset, skip creation: modal auto-creates an
+      # EMPTY secret on deploy and the server runs keyless (the
+      # BYOK default).
+      - name: Ensure karaoke API key secret
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          KARAOKE_API_KEY: ${{ secrets.KARAOKE_API_KEY }}
+        run: |
+          if [ -z "$KARAOKE_API_KEY" ]; then
+            echo "KARAOKE_API_KEY repo secret not set — deploying keyless (BYOK default)."
+          else
+            modal secret create karaoke-api-key "KARAOKE_API_KEY=$KARAOKE_API_KEY" --force
+            echo "karaoke-api-key secret set."
+          fi
+      - name: Deploy to Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          cd server
+          # The Modal App object is named modal_app (not the default
+          # `app`), so it must be named explicitly.
+          modal deploy modal_app.py::modal_app
+      # Smoke check: a deploy can succeed while containers crash-loop
+      # (missing sibling module, 2026-10-26). Fail the run loudly if
+      # /health never answers, so a broken deploy is caught here
+      # instead of sitting silent until Modal's email. This runs once
+      # per deploy only — it does NOT poll continuously, so it never
+      # keeps the GPU container warm between deploys.
+      # The endpoint URL is NOT hardcoded here (it used to leak the
+      # live URL into the repo). Set the repo variable KARAOKE_API_URL
+      # to your deployed app URL, e.g.
+      # https://<your-workspace>--revance-karaoke-api.us-east.modal.run
+      # Without it, the smoke check is skipped (the deploy still
+      # succeeds) and a warning is printed.
+      - name: Smoke check endpoint health
+        env:
+          KARAOKE_API_URL: ${{ vars.KARAOKE_API_URL }}
+        run: |
+          if [ -z "$KARAOKE_API_URL" ]; then
+            echo "WARNING: vars.KARAOKE_API_URL not set — skipping /health smoke check."
+            exit 0
+          fi
+          echo "Waiting for /health (cold start can take minutes)..."
+          ok=""
+          for i in $(seq 1 40); do
+            code=$(curl -sL -o /dev/null -w "%{http_code}" --max-time 30 "$KARAOKE_API_URL/health" || true)
+            echo "attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 15
+          done
+          if [ -z "$ok" ]; then echo "SMOKE CHECK FAILED: /health never returned 200"; exit 1; fi
+          echo "SMOKE CHECK PASSED:"
+          curl -sL --max-time 30 "$KARAOKE_API_URL/health"
