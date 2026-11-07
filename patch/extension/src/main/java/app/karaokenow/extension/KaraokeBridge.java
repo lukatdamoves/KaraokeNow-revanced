@@ -1,6 +1,8 @@
 package app.karaokenow.extension;
 
 import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -44,8 +46,9 @@ import java.util.concurrent.TimeUnit;
  *  - At Lmjr.mi() exit (after the bottom UI is inflated into
  *    Lmju.r) the patch calls initializeBottomButtons(bottom UI
  *    view), which puts small text buttons beside the
- *    fullscreen button: "K" (karaoke) and "BV" (background
- *    vocals toggle).
+ *    fullscreen button: "K" (karaoke), "BV" (background
+ *    vocals toggle), and "LOG" (DEBUG-ONLY clipboard copy of
+ *    the recent log, to be removed after debugging).
  *    Containers and the fullscreen button are
  *    resolved BY RESOURCE NAME, never by numeric ID.
  *  - Buttons are 60dp tall (the fullscreen button's height),
@@ -57,15 +60,14 @@ import java.util.concurrent.TimeUnit;
  *    with black text. K is filled while a karaoke session
  *    is alive, plain when stopped; BV is filled when its
  *    flag is on, plain when off.
- *  - The patch adds synthetic methods to Laiwx (patch_getSpeed,
- *    patch_getPosition, patch_getVideoId) that delegate to
- *    Laiwx's own obfuscated methods. This class also names
- *    obfuscated Laiwx/player members DIRECTLY by reflection:
- *    ar (pause/resume), Q (play state), O + the ae field
- *    (volume), g (the player), and i/l/z (the audio URL).
- *    So if YouTube renames one, the patch's fingerprints AND
- *    these direct names change. Reflection failures are logged
- *    with a full trace and surface as errors, never swallowed.
+ *  - The patch adds synthetic methods to Laiwx (patch_getVolume,
+ *    patch_setVolume, patch_getPosition, patch_isPlaying,
+ *    patch_getVideoId) that delegate to Laiwx's own obfuscated
+ *    methods. This class calls them by REFLECTION on the stored
+ *    controller: the extension never names an obfuscated method,
+ *    so if YouTube renames one, only the patch's fingerprints
+ *    change. Reflection failures are logged with a full trace and
+ *    surface as errors, never swallowed.
  *
  * Roles: this singleton implements KaraokeSession's VideoPosition,
  * MuteController, and Listener, so a tap starts exactly one session
@@ -79,9 +81,9 @@ import java.util.concurrent.TimeUnit;
  * logs and returns.
  *
  * Failure visibility (no PC needed): toasts carry the actual
- * reason, and the recent log lives in the KaraokeLog ring
- * buffer (logcat). A long-press on the K button opens the
- * server setup dialog — no adb, no logcat reader app, no root.
+ * reason, and a long-press on the K button shares the recent log
+ * (KaraokeLog ring buffer) through the system share sheet — no
+ * adb, no logcat reader app, no root.
  */
 public class KaraokeBridge implements KaraokeSession.VideoPosition,
         KaraokeSession.MuteController, KaraokeSession.Listener {
@@ -113,11 +115,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  without this, K shows the setup dialog and starts nothing. */
     private static final String PREFS_NAME = "karaoke_now_prefs";
     private static final String PREF_ENDPOINT = "modal_server_url";
-    /** Server API key for keyed endpoints (the owner's shared
-     *  server). Saved in app-private prefs, never logged, never
-     *  hardcoded. Null = keyless (normal BYOK servers need no
-     *  key). Sent in the WS hello as "key" when present. */
-    private static final String PREF_API_KEY = "karaoke_api_key";
     /** v67: resumable auto-setup job (survives Hide / process
      *  death; tapping K while it runs reopens the progress bar). */
     private static final String PREF_SETUP_JOB = "setup_job_id";
@@ -139,6 +136,7 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  it (cheap: cached container, no hierarchy search). */
     private static Handler videoAlignHandler;
     private static volatile boolean videoAlignGuardActive;
+    private static volatile WeakReference<ViewGroup> videoAlignTargetRef;
     private static final Runnable videoAlignGuard = new Runnable() {
         @Override public void run() {
             if (!videoAlignGuardActive) return;
@@ -150,6 +148,8 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                     return;
                 }
                 fixPlayerInset(ui);
+                updateKaraokeSeekbar(ui.getRootView());
+                updateKaraokeSeekbarActual(ui.getRootView());
             } catch (Exception e) {
                 KaraokeLog.w("video align guard failed", e);
             }
@@ -163,11 +163,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  sessions started later pick it up; live sessions are
      *  switched instantly by the session's player mix. */
     private static volatile boolean backingVocalsEnabled;
-    /** L8: true when the user flipped BV while sticky with no
-     *  live session. startSessionForVideo() must NOT reset a
-     *  flag the user explicitly just set — it is consumed by
-     *  the next session start instead. */
-    private static volatile boolean bvExplicitlySet;
 
     /** Weak refs to the K/BV buttons so session-state changes can
      *  refresh their active (CC-style filled) look. Weak: the
@@ -175,6 +170,16 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  would leak the player Activity. */
     private static volatile WeakReference<TextView> kButtonRef;
     private static volatile WeakReference<TextView> bvButtonRef;
+    /** KEY button: shows the current shift ("KEY", "KEY -2"). */
+    private static volatile WeakReference<TextView> keyButtonRef;
+    /** Current key shift in semitones (mirrored into sessions). */
+    private static volatile int keySemitones = 0;
+    /** Singer's measured profile, kept across songs in this app run. */
+    private static volatile KaraokeVoiceProfile userVoiceProfile;
+    /** Song profile of the current song (from the server), if any. */
+    private static volatile KaraokeVoiceProfile currentSongProfile;
+    /** One key test at a time. */
+    private static volatile KaraokeKeyTest keyTest;
 
     /** Weak ref to the last bottom-UI view, so geometry blocks
      *  can also be logged at controller set and session start
@@ -185,46 +190,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  hide can find it even if the anchor views are gone.
      *  Weak: the overlay belongs to YouTube's hierarchy. */
     private static volatile WeakReference<View> loadingOverlayRef;
-    /** L6: the veil's own timeout, tied to the session's ~30s
-     *  load watchdog (KaraokeSession fails a load after 30s
-     *  with no audio growth). Armed when the veil first shows
-     *  for CONNECTING/BUFFERING; if the session is still
-     *  loading at the deadline, the veil hides and the session
-     *  is stopped instead of hanging forever. Cancelled by
-     *  hideLoadingOverlay(). veilTimeoutSession is the session
-     *  the pending timeout belongs to (stale timeouts no-op). */
-    private static final long VEIL_TIMEOUT_MS = 30000;
-    private static volatile KaraokeSession veilTimeoutSession;
-    private static Handler veilTimeoutHandler;
-    private static final Runnable veilTimeoutTask = new Runnable() {
-        @Override public void run() {
-            try {
-                KaraokeSession s = veilTimeoutSession;
-                if (s == null || session != s) return;
-                KaraokeSession.State st;
-                try {
-                    st = s.state();
-                } catch (Exception ignored) {
-                    return;
-                }
-                if (st != KaraokeSession.State.CONNECTING
-                        && st != KaraokeSession.State.BUFFERING) return;
-                KaraokeLog.w("veil timeout: still loading after 30s;"
-                        + " hiding veil and stopping karaoke");
-                hideLoadingOverlay();
-                try {
-                    s.stop();
-                } catch (Exception e) {
-                    KaraokeLog.w("veil timeout stop failed", e);
-                }
-                if (session == s) session = null;
-                refreshKButton();
-                toast("karaoke failed — tap K to retry", true);
-            } catch (Exception e) {
-                KaraokeLog.w("veil timeout failed", e);
-            }
-        }
-    };
     /** v62: the video container the decor-hosted veil mirrors
      *  (repositioned every guard tick). */
     private static volatile WeakReference<ViewGroup>
@@ -369,41 +334,11 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         // Not sticky: legacy stop-on-switch for a live session.
         // Sticky: ensure a LIVE session on the CURRENT video
         // (restart on switch, start when none/DONE/ERROR).
-        // L9(b): retried up to 3 times when the video ID is not
-        // readable yet (see scheduleControllerSwitchCheck).
-        scheduleControllerSwitchCheck(0);
-    }
-
-    /** L9(b): posts the controller-switch check (1.5s out).
-     *  attempt counts retries when the video ID is unreadable. */
-    private static void scheduleControllerSwitchCheck(int attempt) {
-        final int nextAttempt = attempt;
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            controllerSwitchCheck(nextAttempt);
-        }, 1500);
-    }
-
-    /** The setController delayed switch check. When the video ID
-     *  is unreadable at 1.5s, the sticky restart never happened
-     *  for that video — so retry a few times (up to 3 attempts,
-     *  1.5s apart) instead of giving up after one check. */
-    private static void controllerSwitchCheck(int attempt) {
-        try {
-            String newId = INSTANCE.getVideoIdOrNull();
-            if (newId == null || newId.isEmpty()) {
-                if (attempt < 2) {
-                    KaraokeLog.d("controller switch check: video ID "
-                            + "not readable yet, retry "
-                            + (attempt + 1) + "/2");
-                    scheduleControllerSwitchCheck(attempt + 1);
-                } else {
-                    KaraokeLog.d("controller switch check: video ID "
-                            + "still unreadable after retries; "
-                            + "giving up for this controller");
-                }
-                return;
-            }
-            KaraokeSession cur = session;
+            try {
+                String newId = INSTANCE.getVideoIdOrNull();
+                if (newId == null || newId.isEmpty()) return;
+                KaraokeSession cur = session;
                 boolean alive = false;
                 String oldId = null;
                 if (cur != null) {
@@ -448,9 +383,10 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                     }
                     restartForVideo(newId, "controller-switch");
                 }
-        } catch (Exception e) {
-            KaraokeLog.e("setController switch check failed", e);
-        }
+            } catch (Exception e) {
+                KaraokeLog.e("setController switch check failed", e);
+            }
+        }, 1500);
     }
 
     /** Geometry block for the last known bottom UI, if any.
@@ -467,8 +403,9 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
 
     /**
      * Called by the patch at Lmjr.mi() exit with the inflated
-     * bottom UI view (Lmju.r). Adds small "K" and "BV" text
-     * buttons beside the fullscreen button. Never throws.
+     * bottom UI view (Lmju.r). Adds small "K", "BV", and
+     * DEBUG-ONLY "LOG" text buttons beside the fullscreen
+     * button. Never throws.
      *
      * Anchor order (both resolved BY NAME):
      *  1. bottom_end_container — the horizontal row in the bottom
@@ -529,17 +466,12 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                                 // dead — killed a fresh BUFFERING session).
                                 // Loading states are never orphan-killed;
                                 // the 30s load watchdog owns their fate.
-                                // L6: the session keeps running, but the
-                                // veil must not hang over a detached UI —
-                                // hide it on this confirmed detach.
                                 if (st == KaraokeSession.State.CONNECTING
                                         || st
                                             == KaraokeSession.State.BUFFERING) {
                                     KaraokeLog.i("watch UI detached "
-                                            + "during load; hiding veil, "
-                                            + "session continues (" + st
+                                            + "during load; ignoring (" + st
                                             + ")");
-                                    hideLoadingOverlay();
                                     return;
                                 }
                                 // A detach mid-PLAYING with Q() false can
@@ -586,7 +518,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                                                         + "confirmed dead (3s); "
                                                         + "stopping karaoke");
                                                 fs.stop();
-                                                stopVideoAlignGuard();
                                                 if (session == fs) {
                                                     session = null;
                                                 }
@@ -608,7 +539,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                                         + "stopping karaoke");
                                 karaokeSticky = false;
                                 s.stop();
-                                stopVideoAlignGuard();
                                 if (session == s) session = null;
                                 refreshKButton();
                             }
@@ -638,8 +568,9 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
             }
             bottomUiRef = new WeakReference<>(bottomUi);
             watchWatchUiDetach(bottomUi);
-            // v73: run the player-inset guard (shifts ajjm back
-            // up when YouTube double-insets the player).
+            // v72: undo any shift an older build applied in this
+            // process, then run the (seek-bar-only) guard.
+            restoreVideoAlign();
             startVideoAlignGuard();
             // v6 diagnostics: BEFORE block — the decisive half
             // of the before/after experiment (surface rect
@@ -650,22 +581,16 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                     != null;
             boolean bvAdded = bottomUi.findViewWithTag("karaoke-bv-button")
                     != null;
-            if (kAdded && bvAdded) {
+            boolean keyAdded = bottomUi.findViewWithTag("karaoke-key-button")
+                    != null;
+            // DEBUG-ONLY: temporary LOG button, remove after debugging.
+            boolean logAdded = bottomUi.findViewWithTag(
+                    "karaoke-log-button-debug") != null;
+            if (kAdded && bvAdded && logAdded) {
                 KaraokeLog.d("initializeBottomButtons: buttons present");
                 KaraokeGeometry.logBlock(bottomUi, "buttons present");
-                // Polish: the old early return never rebound the
-                // refs, so a re-inflated bottom UI left K/BV
-                // pointing at detached views. Rebind here.
-                View kView = bottomUi.findViewWithTag("karaoke-button");
-                if (kView instanceof TextView) {
-                    kButtonRef = new WeakReference<>((TextView) kView);
-                }
-                View bvView =
-                        bottomUi.findViewWithTag("karaoke-bv-button");
-                if (bvView instanceof TextView) {
-                    bvButtonRef = new WeakReference<>((TextView) bvView);
-                }
                 refreshBvButton();
+                refreshKeyButton();
                 refreshKButton();
                 return;
             }
@@ -691,6 +616,18 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                     row.addView(bv, rowParams(ctx));
                     bvButtonRef = new WeakReference<>(bv);
                     bvAdded = true;
+                }
+                if (!keyAdded) {
+                    TextView key = makeButton(ctx, "KEY",
+                            "karaoke-key-button",
+                            v -> onKeyButtonClicked(v), null);
+                    row.addView(key, rowParams(ctx));
+                    keyButtonRef = new WeakReference<>(key);
+                    keyAdded = true;
+                }
+                if (!logAdded) {
+                    row.addView(makeLogButton(ctx), rowParams(ctx));
+                    logAdded = true;
                 }
                 refreshBvButton();
                 refreshKButton();
@@ -739,8 +676,22 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                     bvAdded = true;
                     index++;
                 }
+                if (!keyAdded) {
+                    TextView key = makeButton(ctx, "KEY",
+                            "karaoke-key-button",
+                            v -> onKeyButtonClicked(v), null);
+                    parent.addView(key, index, copyParams(anchor));
+                    keyButtonRef = new WeakReference<>(key);
+                    keyAdded = true;
+                    index++;
+                }
+                if (!logAdded) {
+                    parent.addView(makeLogButton(ctx), index,
+                            copyParams(anchor));
+                    logAdded = true;
+                }
                 refreshBvButton();
-                refreshKButton();
+                refreshKeyButton();
                 bottomUi.post(() -> alignButtonsToFullscreen(bottomUi));
                 // v6 diagnostics: see primary path (AFTER block +
                 // layout-change blocks, change-only deduped).
@@ -774,7 +725,7 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  brings the platform grey background — that was the v1 bug
      *  (a big KARAOKE box over the video). TextView has none.
      *  Horizontal padding 12dp + 4dp side margins give even gaps
-     *  between K, BV, and the fullscreen icon (whose own
+     *  between K, BV, LOG, and the fullscreen icon (whose own
      *  60dp view centers a ~24dp glyph, i.e. ~18dp of internal
      *  padding on its left). includeFontPadding off so the text
      *  centers cleanly in the 60dp height. */
@@ -805,6 +756,95 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  CC button's outlined state); active = white-filled
      *  rounded background with black text (the CC button
      *  "fills with white" when toggled on). */
+    // ---------------- key change (docs/KEYCHANGE.md) ----------------
+
+    /** Bridge-side host for the KEY panel (see KaraokeKeyUi). */
+    private static final KaraokeKeyUi.Host KEY_HOST = new KaraokeKeyUi.Host() {
+        @Override
+        public int keySemitones() {
+            return keySemitones;
+        }
+
+        @Override
+        public void setKeySemitones(int semitones, String why) {
+            applyKey(semitones, why);
+        }
+
+        @Override
+        public KaraokeVoiceProfile userProfile() {
+            return userVoiceProfile;
+        }
+
+        @Override
+        public void setUserProfile(KaraokeVoiceProfile profile) {
+            userVoiceProfile = profile;
+            KaraokeSession s = session;
+            if (s != null) s.setUserProfile(profile);
+        }
+
+        @Override
+        public KaraokeVoiceProfile songProfile() {
+            KaraokeSession s = session;
+            return s != null ? s.getSongProfile() : currentSongProfile;
+        }
+
+        @Override
+        public void toast(String message, boolean longDuration) {
+            KaraokeBridge.toast(message, longDuration);
+        }
+
+        @Override
+        public void refreshKeyButton() {
+            KaraokeBridge.refreshKeyButton();
+        }
+    };
+
+    /** Push the current shift into the live session (if any). */
+    private static void applyKey(int semitones, String why) {
+        int folded = KaraokeVoiceProfile.fold(semitones);
+        keySemitones = folded;
+        KaraokeSession s = session;
+        if (s != null) {
+            try {
+                s.setKeySemitones(folded);
+            } catch (Exception e) {
+                KaraokeLog.w("applyKey: session call failed", e);
+            }
+        }
+        refreshKeyButton();
+        String label = KaraokeVoiceProfile.semitoneLabel(folded);
+        toast("Key " + label + ("0".equals(label) ? " (original)" : "")
+                + (why == null ? "" : " - " + why));
+        KaraokeLog.i("key: applied " + label
+                + " (" + (why == null ? "manual" : why) + ")");
+    }
+
+    /** KEY label: "KEY" at 0, otherwise "KEY +2" / "KEY -1". */
+    private static void refreshKeyButton() {
+        try {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                WeakReference<TextView> ref = keyButtonRef;
+                TextView b = ref != null ? ref.get() : null;
+                if (b == null) return;
+                int k = keySemitones;
+                b.setText(k == 0 ? "KEY"
+                        : "KEY " + KaraokeVoiceProfile.semitoneLabel(k));
+                setButtonActive(b, k != 0);
+            });
+        } catch (Exception e) {
+            KaraokeLog.w("refreshKeyButton: post failed", e);
+        }
+    }
+
+    private static void onKeyButtonClicked(View button) {
+        if (!karaokeSticky) {
+            toast("Turn on K first");
+            return;
+        }
+        Context ctx = button != null ? button.getContext() : appContext;
+        KaraokeKeyUi.showDialog(ctx, KEY_HOST);
+    }
+
     private static void setButtonActive(TextView b, boolean active) {
         if (b == null) return;
         if (active) {
@@ -859,7 +899,8 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
             int rowId = res.id("bottom_end_container");
             View rowView = rowId != 0 ? bottomUi.findViewById(rowId) : null;
             int rowH = rowView != null ? rowView.getHeight() : -1;
-            String[] tags = {"karaoke-button", "karaoke-bv-button"};
+            String[] tags = {"karaoke-button", "karaoke-bv-button",
+                    "karaoke-log-button-debug"};
             for (String tag : tags) {
                 View v = bottomUi.findViewWithTag(tag);
                 if (!(v instanceof TextView)) continue;
@@ -894,10 +935,417 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  at the bottom. v71: also track the original top MARGIN —
      *  a layout-real margin shift moves the SurfaceView's actual
      *  surface (parent translation may not), and it is restored
-     *  the same tracked way.
-     *  K5(a): the restoreVideoAlign() half of this was dead
-     *  (videoAlignApplied was never set true anywhere), so it
-     *  was deleted; the v73 inset guard below is the live fix. */
+     *  the same tracked way. */
+    private static volatile float videoAlignOriginalTy;
+    private static volatile int videoAlignOriginalMargin;
+    private static volatile boolean videoAlignMarginKnown;
+    private static volatile boolean videoAlignApplied;
+
+    private static void restoreVideoAlign() {
+        try {
+            if (!videoAlignApplied) return;
+            WeakReference<ViewGroup> tref = videoAlignTargetRef;
+            ViewGroup video = tref != null ? tref.get() : null;
+            if (video != null) {
+                video.setTranslationY(videoAlignOriginalTy);
+                if (videoAlignMarginKnown
+                        && video.getLayoutParams()
+                                instanceof ViewGroup.MarginLayoutParams) {
+                    ViewGroup.MarginLayoutParams mlp =
+                            (ViewGroup.MarginLayoutParams)
+                                    video.getLayoutParams();
+                    if (mlp.topMargin != videoAlignOriginalMargin) {
+                        mlp.topMargin = videoAlignOriginalMargin;
+                        video.setLayoutParams(mlp);
+                    }
+                }
+                KaraokeLog.i("video align: restored "
+                        + "(translationY=" + videoAlignOriginalTy
+                        + ", topMargin=" + videoAlignOriginalMargin
+                        + ")");
+            }
+        } catch (Exception ignored) {
+        }
+        videoAlignApplied = false;
+    }
+
+    // ---- v70 light-blue karaoke buffered seek bar ----
+
+    /** Light blue for the vocal-removed buffered segment. */
+    private static final int KARAOKE_BUFFER_BLUE = 0xFF6EC1FF;
+    private static final String TIME_BAR_CLASS =
+            "com.google.android.libraries.youtube.player.features"
+            + ".overlay.timebar.TimeBar";
+    /** Original {bufferedColor, bufferedEndMs} per TimeBar model,
+     *  restored when karaoke turns off. Weak keys: models are
+     *  recreated on video switches and must GC freely. */
+    private static final java.util.Map<Object, long[]>
+            karaokeBarOriginals = java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<>());
+
+    private static java.lang.reflect.Field fieldUp(Object target,
+            String name) throws Exception {
+        Class<?> type = target.getClass();
+        while (type != null) {
+            try {
+                java.lang.reflect.Field field =
+                        type.getDeclaredField(name);
+                field.setAccessible(true);
+                return field;
+            } catch (NoSuchFieldException e) {
+                type = type.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException(name);
+    }
+
+    private static ArrayList<View> findTimeBars(View root) {
+        ArrayList<View> matches = new ArrayList<>();
+        if (root == null) return matches;
+        ArrayDeque<View> stack = new ArrayDeque<>();
+        stack.push(root);
+        int budget = 6000;
+        while (!stack.isEmpty() && budget-- > 0) {
+            View view = stack.pop();
+            if (TIME_BAR_CLASS.equals(view.getClass().getName())
+                    && view.getWidth() > 0) {
+                matches.add(view);
+            }
+            if (view instanceof ViewGroup) {
+                ViewGroup group = (ViewGroup) view;
+                for (int i = group.getChildCount() - 1; i >= 0; i--) {
+                    View child = group.getChildAt(i);
+                    if (child != null) stack.push(child);
+                }
+            }
+        }
+        return matches;
+    }
+
+    /** While karaoke is active, YouTube's buffered segment (the
+     *  gray part) shows the VOCAL-REMOVED buffered extent in
+     *  light blue — same real TimeBar drawing, repurposed model
+     *  values (alja: i=buffered color, b=buffered end ms,
+     *  a=duration ms, e=offset ms). gn() re-derives paints and
+     *  rects from the model, so the change is persistent and
+     *  exact. Restored (color + end) when karaoke turns off. */
+    private static void updateKaraokeSeekbar(View root) {
+        try {
+            KaraokeSession current = session;
+            boolean active = karaokeSticky && current != null;
+            KaraokeSession.State state = null;
+            if (current != null) {
+                try {
+                    state = current.state();
+                } catch (Exception ignored) {
+                }
+            }
+            active = active && (state == KaraokeSession.State.CONNECTING
+                    || state == KaraokeSession.State.BUFFERING
+                    || state == KaraokeSession.State.PLAYING
+                    || state == KaraokeSession.State.PAUSED);
+            if (!active) {
+                restoreKaraokeSeekbar();
+                return;
+            }
+            if (root == null) return;
+            double coverageSec = -1;
+            try {
+                coverageSec = current.bufferedEndSec();
+            } catch (Exception ignored) {
+            }
+            for (View timeBar : findTimeBars(root)) {
+                try {
+                    Object model = fieldUp(timeBar, "L").get(timeBar);
+                    if (model == null) continue;
+                    // Only the standard model carries these fields
+                    // (live/other variants are skipped silently).
+                    if (!"alja".equals(
+                            model.getClass().getName())) continue;
+                    java.lang.reflect.Field colorField =
+                            fieldUp(model, "i");
+                    java.lang.reflect.Field bufferedField =
+                            fieldUp(model, "b");
+                    java.lang.reflect.Field durationField =
+                            fieldUp(model, "a");
+                    java.lang.reflect.Field offsetField =
+                            fieldUp(model, "e");
+                    if (!karaokeBarOriginals.containsKey(model)) {
+                        karaokeBarOriginals.put(model, new long[] {
+                                colorField.getInt(model),
+                                bufferedField.getLong(model)});
+                    }
+                    colorField.setInt(model, KARAOKE_BUFFER_BLUE);
+                    long duration = durationField.getLong(model);
+                    long offset = offsetField.getLong(model);
+                    if (duration > offset && coverageSec >= 0) {
+                        long karaokeEnd = offset
+                                + (long) (coverageSec * 1000.0);
+                        bufferedField.setLong(model, Math.max(offset,
+                                Math.min(duration, karaokeEnd)));
+                    }
+                    java.lang.reflect.Method gn =
+                            timeBar.getClass().getDeclaredMethod("gn");
+                    gn.setAccessible(true);
+                    gn.invoke(timeBar);
+                } catch (Exception e) {
+                    KaraokeLog.w("karaoke seekbar tint failed", e);
+                }
+            }
+        } catch (Exception e) {
+            KaraokeLog.w("karaoke seekbar update failed", e);
+        }
+    }
+
+    private static void restoreKaraokeSeekbar() {
+        if (karaokeBarOriginals.isEmpty()) return;
+        synchronized (karaokeBarOriginals) {
+            for (java.util.Map.Entry<Object, long[]> entry
+                    : karaokeBarOriginals.entrySet()) {
+                Object model = entry.getKey();
+                long[] original = entry.getValue();
+                if (model == null || original == null) continue;
+                try {
+                    fieldUp(model, "i").setInt(model, (int) original[0]);
+                    fieldUp(model, "b").setLong(model, original[1]);
+                } catch (Exception e) {
+                    KaraokeLog.w("karaoke seekbar restore failed", e);
+                }
+            }
+            karaokeBarOriginals.clear();
+        }
+    }
+
+    /** v77: the watch seek bar is `igk`; its buffered segment is
+     *  drawn by the bar itself from its model (alja: b = buffered
+     *  end ms) and paint bundle (igl). No overlays anymore (they
+     *  floated/clamped wrong while scrolling): while karaoke is
+     *  active we set the REAL bar's buffered end to the karaoke
+     *  coverage end and its buffered paints (alja.m, copied into
+     *  igl.i by gn(), plus igl.b) to light blue, then gn() so the
+     *  bar redraws itself. The native buffered rect spans from
+     *  the bar's left, so behind + ahead are covered and seeking
+     *  stays clamped by the bar's own geometry. Restored on off. */
+    private static volatile long lastSeekbarDiagMs;
+    private static volatile long lastSeekbarFoundDiagMs;
+
+    private static class IgkOriginal {
+        final WeakReference<View> view;
+        final long bufferedEnd;
+        /** Colors of every resolved buffered paint, in order. */
+        final java.util.ArrayList<Integer> paintColors;
+        IgkOriginal(View view, long bufferedEnd,
+                java.util.ArrayList<Integer> paintColors) {
+            this.view = new WeakReference<>(view);
+            this.bufferedEnd = bufferedEnd;
+            this.paintColors = paintColors;
+        }
+    }
+
+    /** Every buffered paint the bar can draw from: igk's own
+     *  bundle (c) plus the renderer's bundle (ign.a / igt.c) —
+     *  they are not guaranteed to be the same igl instance, and
+     *  painting only one left the future segment red. Distinct
+     *  igl.c / igl.e paints, in resolution order. */
+    private static java.util.ArrayList<android.graphics.Paint>
+            resolveBufferedPaints(View barView) {
+        java.util.ArrayList<android.graphics.Paint> out =
+                new java.util.ArrayList<>();
+        Object[] bundles = new Object[3];
+        try {
+            bundles[0] = fieldUp(barView, "c").get(barView);
+        } catch (Exception ignored) {
+        }
+        try {
+            Object ign = fieldUp(barView, "h").get(barView);
+            if (ign != null) bundles[1] = fieldUp(ign, "a").get(ign);
+        } catch (Exception ignored) {
+        }
+        try {
+            Object igt = fieldUp(barView, "i").get(barView);
+            if (igt != null) bundles[2] = fieldUp(igt, "c").get(igt);
+        } catch (Exception ignored) {
+        }
+        for (Object bundle : bundles) {
+            if (bundle == null || !"igl".equals(
+                    bundle.getClass().getSimpleName())) continue;
+            for (String fieldName : new String[] {"c", "e"}) {
+                try {
+                    android.graphics.Paint paint =
+                            (android.graphics.Paint)
+                                    fieldUp(bundle, fieldName).get(bundle);
+                    if (paint != null && !out.contains(paint)) {
+                        out.add(paint);
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return out;
+    }
+
+    private static final java.util.Map<Object, IgkOriginal>
+            karaokeIgkOriginals = java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<>());
+
+    private static void seekbarDiag(String message) {
+        long now = System.currentTimeMillis();
+        if (now - lastSeekbarDiagMs < 3000) return;
+        lastSeekbarDiagMs = now;
+        KaraokeLog.d("seekbar diag: " + message);
+    }
+
+    private static void updateKaraokeSeekbarActual(View root) {
+        try {
+            KaraokeSession current = session;
+            boolean active = karaokeSticky && current != null;
+            KaraokeSession.State state = null;
+            if (current != null) {
+                try {
+                    state = current.state();
+                } catch (Exception ignored) {
+                }
+            }
+            active = active && (state == KaraokeSession.State.CONNECTING
+                    || state == KaraokeSession.State.BUFFERING
+                    || state == KaraokeSession.State.PLAYING
+                    || state == KaraokeSession.State.PAUSED);
+            if (!active || root == null) {
+                restoreKaraokeSeekbarActual();
+                return;
+            }
+            double endSec;
+            try {
+                endSec = current.bufferedEndSec();
+                double[] cached = current.karaokeCachedCoverage();
+                if (cached != null) {
+                    endSec = Math.max(endSec, cached[1]);
+                }
+            } catch (Exception e) {
+                endSec = -1;
+            }
+            seekbarDiag("state=" + state + " covEnd="
+                    + String.format("%.1f", endSec));
+            if (endSec < 0) return;
+            // Widest shown igk = the full-width watch bar.
+            View barView = null;
+            ArrayDeque<View> stack = new ArrayDeque<>();
+            stack.push(root);
+            int budget = 6000;
+            while (!stack.isEmpty() && budget-- > 0) {
+                View view = stack.pop();
+                if ("igk".equals(view.getClass().getSimpleName())
+                        && view.getWidth() > 0 && view.isShown()) {
+                    if (barView == null
+                            || view.getWidth() > barView.getWidth()) {
+                        barView = view;
+                    }
+                }
+                if (view instanceof ViewGroup) {
+                    ViewGroup group = (ViewGroup) view;
+                    for (int i = group.getChildCount() - 1; i >= 0; i--) {
+                        View child = group.getChildAt(i);
+                        if (child != null) stack.push(child);
+                    }
+                }
+            }
+            if (barView == null) {
+                if (System.currentTimeMillis()
+                        - lastSeekbarFoundDiagMs > 3000) {
+                    lastSeekbarFoundDiagMs = System.currentTimeMillis();
+                    KaraokeLog.d("seekbar diag: no shown igk seek bar");
+                }
+                return;
+            }
+            Object model = fieldUp(barView, "L").get(barView);
+            if (model == null || !"alja".equals(
+                    model.getClass().getName())) {
+                return;
+            }
+            java.lang.reflect.Field bField = fieldUp(model, "b");
+            java.lang.reflect.Field aField = fieldUp(model, "a");
+            java.lang.reflect.Field eField = fieldUp(model, "e");
+            long duration = aField.getLong(model);
+            long offset = eField.getLong(model);
+            if (duration <= offset) return;
+            // Buffered paints, proven from igq case 1 (the
+            // future segment draw): igl.c normally, igl.e in the
+            // live state — across every bundle instance the
+            // renderer can hold (igk.c vs ign.a/igt.c differ).
+            java.util.ArrayList<android.graphics.Paint> paints =
+                    resolveBufferedPaints(barView);
+            if (!karaokeIgkOriginals.containsKey(model)) {
+                java.util.ArrayList<Integer> colors =
+                        new java.util.ArrayList<>();
+                for (android.graphics.Paint paint : paints) {
+                    colors.add(paint.getColor());
+                }
+                karaokeIgkOriginals.put(model, new IgkOriginal(
+                        barView, bField.getLong(model), colors));
+                KaraokeLog.i("karaoke seekbar: actual bar hooked "
+                        + "(paints=" + paints.size() + ")");
+            }
+            long karaokeEnd = offset + (long) (endSec * 1000.0);
+            bField.setLong(model, Math.max(offset,
+                    Math.min(duration, karaokeEnd)));
+            for (android.graphics.Paint paint : paints) {
+                paint.setColor(KARAOKE_BUFFER_BLUE);
+            }
+            java.lang.reflect.Method gn =
+                    barView.getClass().getDeclaredMethod("gn");
+            gn.setAccessible(true);
+            gn.invoke(barView);
+            barView.invalidate();
+            if (System.currentTimeMillis() - lastSeekbarFoundDiagMs
+                    > 3000) {
+                lastSeekbarFoundDiagMs = System.currentTimeMillis();
+                KaraokeLog.d("seekbar diag: actual igk tinted, "
+                        + "bufferedEnd=" + bField.getLong(model)
+                        + " of " + duration);
+            }
+        } catch (Exception e) {
+            KaraokeLog.w("karaoke seekbar actual failed", e);
+        }
+    }
+
+    private static void restoreKaraokeSeekbarActual() {
+        if (karaokeIgkOriginals.isEmpty()) return;
+        synchronized (karaokeIgkOriginals) {
+            for (java.util.Map.Entry<Object, IgkOriginal> entry
+                    : karaokeIgkOriginals.entrySet()) {
+                Object model = entry.getKey();
+                IgkOriginal original = entry.getValue();
+                if (model == null || original == null) continue;
+                try {
+                    fieldUp(model, "b").setLong(model,
+                            original.bufferedEnd);
+                    View view = original.view.get();
+                    if (view != null) {
+                        try {
+                            java.util.ArrayList<android.graphics.Paint>
+                                    paints = resolveBufferedPaints(view);
+                            for (int i = 0; i < paints.size()
+                                    && i < original.paintColors.size();
+                                    i++) {
+                                paints.get(i).setColor(
+                                        original.paintColors.get(i));
+                            }
+                        } catch (Exception ignored) {
+                        }
+                        java.lang.reflect.Method gn = view.getClass()
+                                .getDeclaredMethod("gn");
+                        gn.setAccessible(true);
+                        gn.invoke(view);
+                        view.invalidate();
+                    }
+                } catch (Exception e) {
+                    KaraokeLog.w("karaoke seekbar restore failed", e);
+                }
+            }
+            karaokeIgkOriginals.clear();
+        }
+    }
+
     // ---- v73 player double-inset fix ----
 
     /** Tracked correction state for the ajjm inset (below). */
@@ -1045,20 +1493,11 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         videoAlignHandler.postDelayed(videoAlignGuard, 500);
     }
 
-    /** L1: stops the align poll (idempotent). Called on
-     *  confirmed bottom-UI detach and when karaoke goes
-     *  inactive, so the guard stops running its decor
-     *  traversal every 500 ms for the lifetime of the YouTube
-     *  process. The next bottom-UI inflation restarts it via
-     *  startVideoAlignGuard(). No activity-death hook exists
-     *  in this file to wire — the guard's own exit (bottom UI
-     *  gone) covers process/activity death. */
-    private static void stopVideoAlignGuard() {
-        videoAlignGuardActive = false;
-        if (videoAlignHandler != null) {
-            videoAlignHandler.removeCallbacks(videoAlignGuard);
-        }
-    }
+    /** K button states (v42): LOADING shows a spinner glyph and
+     *  ignores taps (no accidental stop/resume mid-load); LIVE is
+     *  filled and tapping stops; IDLE is plain K and tapping
+     *  starts. Always posts to the main thread. */
+    private enum KMode { IDLE, LOADING, LIVE }
 
     /** v54: K shows the STICKY flag (filled from the tap until
      *  tapped again), not transient session state — so DONE,
@@ -1093,6 +1532,17 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         } catch (Exception e) {
             KaraokeLog.w("refreshBvButton: post failed", e);
         }
+    }
+
+    /** DEBUG-ONLY (temporary): LOG button. Tapping it copies the
+     *  recent karaoke log to the clipboard — faster than the
+     *  long-press-K share sheet when the user just needs to
+     *  paste the log into chat. REMOVE AFTER DEBUGGING: delete
+     *  this method, its makeLogButton call sites, and the
+     *  karaoke-log-button-debug tag checks. */
+    private static TextView makeLogButton(Context ctx) {
+        return makeButton(ctx, "LOG", "karaoke-log-button-debug",
+                v -> copyLogToClipboard(), null);
     }
 
     /** LayoutParams for the bottom row: wrap content wide, 60dp
@@ -1228,7 +1678,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         // for the next K session).
         if (!karaokeSticky) {
             backingVocalsEnabled = false;
-            bvExplicitlySet = false;
             KaraokeSession currentOff = session;
             if (currentOff != null) {
                 try {
@@ -1254,25 +1703,64 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         toast("Background vocals "
                 + (backingVocalsEnabled ? "ON" : "OFF"));
         KaraokeSession current = session;
-        // L8: toggled while sticky but with no live session —
-        // the next session start must NOT reset a flag the user
-        // explicitly just set. Remember it; startSessionForVideo
-        // consumes it. A live session gets the mix immediately.
-        boolean live = false;
-        if (current != null) {
-            try {
-                KaraokeSession.State st = current.state();
-                live = st == KaraokeSession.State.CONNECTING
-                        || st == KaraokeSession.State.BUFFERING
-                        || st == KaraokeSession.State.PLAYING
-                        || st == KaraokeSession.State.PAUSED;
-            } catch (Exception ignored) {
-                live = false;
-            }
-        }
-        bvExplicitlySet = !live;
         if (current != null) {
             current.setBackingVocalsEnabled(backingVocalsEnabled);
+        }
+    }
+
+    /** DEBUG-ONLY (temporary): copies the recent karaoke log to
+     *  the clipboard and confirms with a toast, so the user can
+     *  paste it straight into chat. No share sheet, no PC, no
+     *  adb. REMOVE AFTER DEBUGGING together with makeLogButton.
+     *  Never includes keys or full URLs (KaraokeLog.dump
+     *  already excludes them). */
+    private static void copyLogToClipboard() {
+        Context ctx = appContext;
+        if (ctx == null) {
+            KaraokeLog.e("copyLogToClipboard: no app context yet");
+            return;
+        }
+        try {
+            ClipboardManager cm = (ClipboardManager)
+                    ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null) {
+                toast("No clipboard available");
+                return;
+            }
+            cm.setPrimaryClip(ClipData.newPlainText(
+                    "KaraokeNow log", KaraokeLog.dump()));
+            KaraokeLog.i("log copied to clipboard");
+            toast("Log copied");
+        } catch (Exception e) {
+            KaraokeLog.e("copyLogToClipboard failed", e);
+            toast("Could not copy log: " + shortReason(e));
+        }
+    }
+
+    /** Shares the recent karaoke log through the system share
+     *  sheet (long-press K). No PC, no adb, no root: the user
+     *  picks where the text goes (Files, Drive, a message to
+     *  himself). Never includes keys or full URLs. */
+    private static void shareLog() {
+        Context ctx = appContext;
+        if (ctx == null) {
+            KaraokeLog.e("shareLog: no app context yet");
+            return;
+        }
+        try {
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType("text/plain");
+            send.putExtra(Intent.EXTRA_SUBJECT, "KaraokeNow log");
+            send.putExtra(Intent.EXTRA_TEXT, KaraokeLog.dump());
+            send.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            Intent chooser = Intent.createChooser(send,
+                    "Share karaoke log");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(chooser);
+            KaraokeLog.i("log shared via chooser");
+        } catch (Exception e) {
+            KaraokeLog.e("shareLog failed", e);
+            toast("Could not share log: " + shortReason(e));
         }
     }
 
@@ -1290,20 +1778,12 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         }
     }
 
-    /** Saved user endpoint (normalized wss URL) or null.
-     *  S6: a stored value that is not wss:// (e.g. a ws://
-     *  endpoint saved by an older build) is treated as no
-     *  endpoint — fail closed, never start on plaintext. */
+    /** Saved user endpoint (normalized wss URL) or null. */
     private static String savedEndpoint() {
         SharedPreferences p = prefs();
         if (p == null) return null;
         String s = p.getString(PREF_ENDPOINT, null);
-        if (s == null || s.isEmpty()) return null;
-        if (!s.toLowerCase(java.util.Locale.US).startsWith("wss://")) {
-            KaraokeLog.w("saved endpoint rejected: not wss://");
-            return null;
-        }
-        return s;
+        return (s == null || s.isEmpty()) ? null : s;
     }
 
     private static void saveEndpoint(String normalized) {
@@ -1313,28 +1793,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         KaraokeWarmup.configure(normalized);
         KaraokeLog.i("BYOK endpoint saved: host="
                 + KaraokeLog.hostOf(normalized));
-    }
-
-    /** Saved server API key, or null when none is saved. The
-     *  value is never logged. */
-    private static String savedApiKey() {
-        SharedPreferences p = prefs();
-        if (p == null) return null;
-        String s = p.getString(PREF_API_KEY, null);
-        return (s == null || s.isEmpty()) ? null : s;
-    }
-
-    /** Saves the API key (null/empty clears it). Never logs it. */
-    private static void saveApiKey(String key) {
-        SharedPreferences p = prefs();
-        if (p == null) return;
-        if (key == null || key.isEmpty()) {
-            p.edit().remove(PREF_API_KEY).apply();
-        } else {
-            p.edit().putString(PREF_API_KEY, key).apply();
-        }
-        KaraokeLog.i("karaoke API key "
-                + (key == null || key.isEmpty() ? "cleared" : "saved"));
     }
 
     private static String savedSetupJob() {
@@ -1367,9 +1825,7 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  slug (builds the standard revance-karaoke URL). Returns
      *  null for anything else — including raw Modal API tokens
      *  (ak-/as-...), which cannot route to a server by themselves
-     *  and are never stored. S6: wss:// ONLY — plaintext ws://
-     *  and http:// are rejected (fail closed), so the phone
-     *  never talks karaoke over an unencrypted socket. */
+     *  and are never stored. */
     private static String normalizeEndpoint(String raw) {
         if (raw == null) return null;
         String s = raw.trim();
@@ -1388,14 +1844,14 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
             scheme = "wss";
             rest = s.substring(6);
         } else if (lower.startsWith("ws://")) {
-            // S6: plaintext WS rejected — wss:// only.
-            return null;
+            scheme = "ws";
+            rest = s.substring(5);
         } else if (lower.startsWith("https://")) {
             scheme = "wss";
             rest = s.substring(8);
         } else if (lower.startsWith("http://")) {
-            // S6: plaintext HTTP rejected — wss:// only.
-            return null;
+            scheme = "ws";
+            rest = s.substring(7);
         } else if (lower.contains(".modal.run")) {
             scheme = "wss";
             rest = s;
@@ -1522,27 +1978,10 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                             + "--token-id ak-... "
                             + "--token-secret as-...");
                     form.addView(tokenInput);
-                    // Server API key (optional): only servers that
-                    // require one need it — normal BYOK servers do
-                    // not. Saved independently of the token below,
-                    // so a key can be stored without redeploying.
-                    // Password-masked; the value is never logged.
-                    EditText keyInput = new EditText(act);
-                    keyInput.setSingleLine(true);
-                    keyInput.setInputType(
-                            android.text.InputType.TYPE_CLASS_TEXT
-                            | android.text.InputType
-                                    .TYPE_TEXT_VARIATION_PASSWORD);
-                    keyInput.setHint("Server API key (optional)");
-                    String savedKey = savedApiKey();
-                    if (savedKey != null) keyInput.setText(savedKey);
-                    form.addView(keyInput);
                     AlertDialog dialog = new AlertDialog.Builder(act)
                             .setTitle("Karaoke setup")
                             .setView(form)
                             .setPositiveButton("Set up", (d, w) -> {
-                                saveApiKey(keyInput.getText()
-                                        .toString().trim());
                                 String[] pair = parseModalTokenCommand(
                                         tokenInput.getText().toString());
                                 if (pair == null) {
@@ -1640,9 +2079,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                 setupPollerActive = false;
                 clearSetupJob();
                 KaraokeLog.e("auto-setup failed", e);
-                // L4: setup failed before any session — put the
-                // video back instead of leaving it paused.
-                resumeVideoIfSetupCancelled();
                 if (!setupProgressDialogShowing) {
                     toast("Karaoke setup failed — tap K to retry", true);
                 }
@@ -1660,35 +2096,16 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
     private static void pollSetupJob(String jobId) {
         long since = savedSetupSince();
         if (since <= 0) since = System.currentTimeMillis();
-        // L3: the old loop ran forever on a dead helper. Cap
-        // total elapsed time (~15 min from loop start) and
-        // consecutive null status reads (5); either cap fails
-        // cleanly via the catch below (error text, job cleared,
-        // video resumed, "tap K to retry").
-        final long pollStartMs = System.currentTimeMillis();
-        final long pollMaxMs = 15 * 60 * 1000;
-        final int maxConsecutiveNulls = 5;
-        int consecutiveNulls = 0;
         try {
             String deployedUrl = null;
             while (true) {
                 Thread.sleep(4000);
-                if (System.currentTimeMillis() - pollStartMs > pollMaxMs) {
-                    throw new Exception(
-                            "setup timed out — tap K to retry");
-                }
                 org.json.JSONObject st = httpJson("GET",
                         SETUP_HELPER_URL + "/setup/status/" + jobId, null);
                 if (st == null) {
-                    consecutiveNulls++;
-                    if (consecutiveNulls >= maxConsecutiveNulls) {
-                        throw new Exception("setup helper unreachable"
-                                + " — tap K to retry");
-                    }
                     setupStageText = "Waiting for the setup helper...";
                     continue;
                 }
-                consecutiveNulls = 0;
                 String state = st.optString("state", "running");
                 if ("running".equals(state)) {
                     int reported = st.optInt("progress", -1);
@@ -1757,18 +2174,12 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         } catch (InterruptedException ie) {
             setupPollerActive = false;
             Thread.currentThread().interrupt();
-            // L4: interrupted setup leaves no session — resume
-            // the video instead of leaving it paused.
-            resumeVideoIfSetupCancelled();
         } catch (Exception e) {
             setupErrorText = shortReason(e);
             setupStageText = "Setup failed";
             setupPollerActive = false;
             clearSetupJob();
             KaraokeLog.e("auto-setup poll failed", e);
-            // L4: setup failed before any session — put the
-            // video back instead of leaving it paused.
-            resumeVideoIfSetupCancelled();
             if (!setupProgressDialogShowing) {
                 toast("Karaoke setup failed — tap K to retry", true);
             }
@@ -1973,28 +2384,9 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
             }
             String videoId = INSTANCE.getVideoIdOrNull();
             if (videoId == null || videoId.isEmpty()) {
-                // L13: the old log claimed "starts when readable"
-                // but nothing ever retried. Now it really does —
-                // when an endpoint exists, stick K on and retry
-                // the switch check (it starts the session once
-                // the ID is readable). With no endpoint saved, a
-                // retry would pop the setup dialog unprompted,
-                // so say plainly to tap K again instead.
-                if (savedEndpoint() != null) {
-                    karaokeSticky = true;
-                    KaraokeLog.i("karaoke button tapped but video ID "
-                            + "is null/empty; sticky on, retrying "
-                            + "when readable");
-                    toast("Video loading — karaoke will start "
-                            + "when ready");
-                    scheduleControllerSwitchCheck(0);
-                } else {
-                    KaraokeLog.i("karaoke button tapped but video ID "
-                            + "is null/empty; tap K again once the "
-                            + "video loads");
-                    toast("Karaoke could not read the video — "
-                            + "tap K again");
-                }
+                KaraokeLog.e("karaoke button tapped but video ID is "
+                        + "null/empty; sticky stays, starts when readable");
+                toast("Karaoke could not read the video");
                 refreshKButton();
                 return;
             }
@@ -2046,9 +2438,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  audio can use it — K-off, errors, song end, and every new
      *  session start. (Q16: default off, never sticky.) */
     private static void resetBvToDefault() {
-        // L8: a real reset (K-off, song end, error) also clears
-        // the explicit-set marker — the default is OFF again.
-        bvExplicitlySet = false;
         if (!backingVocalsEnabled) {
             refreshBvButton();
             return;
@@ -2066,40 +2455,7 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
     }
 
     private static void startSessionForVideo(String videoId, String why) {
-        // L2: never overwrite a live session — stop it first so
-        // the old WS/player is not orphaned (and its mute
-        // bookkeeping does not fight the new session).
-        KaraokeSession cur = session;
-        if (cur != null) {
-            try {
-                KaraokeSession.State st = cur.state();
-                boolean live = st == KaraokeSession.State.CONNECTING
-                        || st == KaraokeSession.State.BUFFERING
-                        || st == KaraokeSession.State.PLAYING
-                        || st == KaraokeSession.State.PAUSED;
-                if (live) {
-                    KaraokeLog.i("startSessionForVideo: stopping "
-                            + "live session first (state=" + st + ")");
-                    cur.stop();
-                }
-            } catch (Exception e) {
-                KaraokeLog.w("startSessionForVideo: live check failed", e);
-            }
-            session = null;
-        }
-        // L8: do NOT reset a BV flag the user explicitly just
-        // set while sticky with no live session — the new
-        // session picks it up. Otherwise the v58 default (OFF)
-        // applies. The explicit marker is consumed here.
-        if (bvExplicitlySet) {
-            bvExplicitlySet = false;
-            KaraokeLog.i("startSessionForVideo: keeping "
-                    + "user-set BV=" + backingVocalsEnabled);
-        } else {
-            resetBvToDefault();
-        }
-        // Polish: a fresh start clears the stale "Last failure".
-        KaraokeLog.clearLastFailure();
+        resetBvToDefault();
         // v6 diagnostics: geometry at session start (same
         // numbers as the layout blocks unless something moved).
         logGeometry("session start");
@@ -2111,10 +2467,14 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
             showServerSetupDialog(null);
             return;
         }
-        KaraokeSettings settings = new KaraokeSettings(endpoint,
-                savedApiKey(), 0, backingVocalsEnabled);
+        KaraokeSettings settings = new KaraokeSettings(endpoint, null,
+                0, backingVocalsEnabled);
         KaraokeSession next = new KaraokeSession(
                 settings, INSTANCE, INSTANCE, INSTANCE);
+        // Carry the key state into the new session: the shifter is
+        // per-session, so it must be re-armed with the current value.
+        next.setKeySemitones(keySemitones);
+        if (userVoiceProfile != null) next.setUserProfile(userVoiceProfile);
         session = next;
         KaraokeLog.i("sticky K: starting karaoke on " + videoId
                 + " (" + why + ")");
@@ -2128,38 +2488,8 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  start. Bypasses the tap cooldown (not a tap). */
     private static void restartForVideo(String newVideoId, String why) {
         if (newVideoId == null || newVideoId.isEmpty()) return;
-        // L2: re-check immediately before starting — a K tap
-        // between the restart being scheduled and running must
-        // not resurrect karaoke after K-off, and a session
-        // already live on THIS video must not be restarted.
-        if (!karaokeSticky) {
-            KaraokeLog.i("restartForVideo: K no longer sticky; "
-                    + "not starting");
-            return;
-        }
-        KaraokeSession cur = session;
-        if (cur != null) {
-            try {
-                KaraokeSession.State st = cur.state();
-                boolean live = st == KaraokeSession.State.CONNECTING
-                        || st == KaraokeSession.State.BUFFERING
-                        || st == KaraokeSession.State.PLAYING
-                        || st == KaraokeSession.State.PAUSED;
-                if (live && newVideoId.equals(cur.sessionVideoId())) {
-                    KaraokeLog.i("restartForVideo: session already "
-                            + "live on " + newVideoId);
-                    return;
-                }
-            } catch (Exception ignored) {
-            }
-        }
-        // M5: force a fresh volume read-back (verifyMuted) so
-        // the pre-mute is not a flag-only proof; mute for real
-        // when the read-back says the video is audible.
         try {
-            if (!INSTANCE.verifyMuted()) {
-                INSTANCE.setMuted(true);
-            }
+            INSTANCE.setMuted(true);
         } catch (Exception e) {
             KaraokeLog.w("sticky pre-mute threw", e);
         }
@@ -2334,15 +2664,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
     private static final Map<String, Integer> playPauseIdCache =
             new HashMap<>();
     private static volatile long lastEnforceDiagMs;
-    /** L7: the 50 ms guard no longer runs a full decor DFS on
-     *  every tick. The DFS runs at most once per second (or
-     *  immediately when a layout change flags it); on the
-     *  50 ms ticks in between, only the already-matched views
-     *  are re-checked cheaply (still attached, alpha still 0).
-     *  The matched set is identical — only the scan frequency
-     *  changes. */
-    private static volatile long lastPlayPauseDfsMs;
-    private static volatile boolean playPauseDfsRequested;
 
     private static int[] playPauseIds(Context ctx) {
         int[] ids = new int[PLAY_PAUSE_ID_NAMES.length];
@@ -2581,21 +2902,8 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         }
         repositionLoadingOverlay();
 
-        // L7: cheap cached re-assert every tick; the full decor
-        // DFS runs at most once per second, or immediately when
-        // a layout change flagged fresh inflations. The matched
-        // set is identical — only the scan frequency changes.
-        reassertCachedPlayPauseViews();
-        long nowMs = System.currentTimeMillis();
-        int matched = 0;
         int before = removedYoutubePlayPauseViews.size();
-        boolean dfsDue = playPauseDfsRequested
-                || nowMs - lastPlayPauseDfsMs >= 1000;
-        if (dfsDue) {
-            playPauseDfsRequested = false;
-            lastPlayPauseDfsMs = nowMs;
-            matched = hideMatchingPlayPauseControls(root, ctx);
-        }
+        int matched = hideMatchingPlayPauseControls(root, ctx);
         int after = removedYoutubePlayPauseViews.size();
         if (after > before) {
             KaraokeLog.i("youtube play/pause controls transparent "
@@ -2604,33 +2912,11 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         }
         // v58 diagnostic: throttled proof of what each enforce
         // sees (catches tap-inflated variants in the next log).
+        long nowMs = System.currentTimeMillis();
         if (nowMs - lastEnforceDiagMs > 3000) {
             lastEnforceDiagMs = nowMs;
             KaraokeLog.d("play/pause enforce: matched=" + matched
                     + " tracked=" + after);
-        }
-    }
-
-    /** L7: cheap per-tick re-check of the views the last DFS
-     *  matched — still attached, alpha still 0, still disabled.
-     *  No hierarchy traversal. Dead (GC'd) records are dropped
-     *  so the list cannot grow stale. */
-    private static void reassertCachedPlayPauseViews() {
-        for (int i = removedYoutubePlayPauseViews.size() - 1; i >= 0; i--) {
-            RemovedPlayerView record = removedYoutubePlayPauseViews.get(i);
-            View view = record.view.get();
-            if (view == null) {
-                removedYoutubePlayPauseViews.remove(i);
-                continue;
-            }
-            try {
-                if (view.getParent() == null) continue;
-                if (view.getAlpha() != 0f) view.setAlpha(0f);
-                if (view.isEnabled()) view.setEnabled(false);
-                if (view.isClickable()) view.setClickable(false);
-                if (view.isFocusable()) view.setFocusable(false);
-            } catch (Exception ignored) {
-            }
         }
     }
 
@@ -2672,10 +2958,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                     long now = System.currentTimeMillis();
                     if (now - lastLayoutEnforceMs < 150) return;
                     lastLayoutEnforceMs = now;
-                    // L7: the hierarchy changed — the next
-                    // enforce must run the full DFS now, not
-                    // wait for the 1s throttle.
-                    playPauseDfsRequested = true;
                     try {
                         enforceYoutubePlayPauseRemoval();
                     } catch (Exception e) {
@@ -3032,52 +3314,11 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         return null;
     }
 
-    /** L6: arms the veil timeout for the current session.
-     *  Absolute 30s from the first CONNECTING (not re-armed on
-     *  the CONNECTING->BUFFERING transition), matching the
-     *  session's 30s load watchdog. Only armed while the veil
-     *  is a LOAD veil — rebuffer veils (state PLAYING) never
-     *  arm it, so a mid-song rebuffer is not killed at 30s. */
-    private static void scheduleVeilTimeout() {
-        try {
-            KaraokeSession s = session;
-            if (s == null) return;
-            KaraokeSession.State st;
-            try {
-                st = s.state();
-            } catch (Exception ignored) {
-                return;
-            }
-            if (st != KaraokeSession.State.CONNECTING
-                    && st != KaraokeSession.State.BUFFERING) return;
-            if (veilTimeoutSession != null) return; // already armed
-            veilTimeoutSession = s;
-            if (veilTimeoutHandler == null) {
-                veilTimeoutHandler = new Handler(Looper.getMainLooper());
-            }
-            veilTimeoutHandler.removeCallbacks(veilTimeoutTask);
-            veilTimeoutHandler.postDelayed(veilTimeoutTask,
-                    VEIL_TIMEOUT_MS);
-        } catch (Exception e) {
-            KaraokeLog.w("veil timeout schedule failed", e);
-        }
-    }
-
-    /** L6: cancels a pending veil timeout (called by
-     *  hideLoadingOverlay on every veil exit). */
-    private static void cancelVeilTimeout() {
-        veilTimeoutSession = null;
-        if (veilTimeoutHandler != null) {
-            veilTimeoutHandler.removeCallbacks(veilTimeoutTask);
-        }
-    }
-
     /** Hides the loading overlay on every session exit path
      *  (PLAYING via onState, ERROR via onState+onError, IDLE
      *  via onState on stop). Posted to main; a missing overlay
      *  is a no-op, never an error. */
     private static void hideLoadingOverlay() {
-        cancelVeilTimeout();
         try {
             new Handler(Looper.getMainLooper()).post(() -> {
                 try {
@@ -3177,7 +3418,7 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                 // logging below only fires on the direct-invoke path,
                 // but gate calls arrive on karaoke-ws-reader and take
                 // this posted-to-main path — without this line the
-                // phone-side ring can never show why patch_getSpeed
+                // phone-side ring can never show why patch_setVolume
                 // (or any synthetic) failed.
                 Throwable t = holder[0];
                 Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException
@@ -3214,7 +3455,7 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
             // phone-side ring never showed what the synthetic
             // itself threw — that is why the v13 mute failure
             // showed only "InvocationTargetException: null".
-            // Log the cause explicitly so the phone-side ring
+            // Log the cause explicitly so the LOG button dump
             // reveals it. No behavior change: the same
             // IllegalStateException is still thrown below, and
             // no return value or failure handling changes.
@@ -3703,29 +3944,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
     }
 
     private String getVideoIdOrNull() {
-        // L9(a): the response model being detached mid-switch
-        // (Laiwl.l null) is a benign early/timing case, not an
-        // error — log it at debug and skip the synthetic
-        // entirely instead of crying "failed" with a full trace
-        // on every poll tick. Only a failure WITH a readable
-        // model logs at error level.
-        try {
-            Object c = controller;
-            if (c == null) {
-                KaraokeLog.d("getVideoId: no controller yet (benign)");
-                return null;
-            }
-            Object i = fieldOf(c, "i");
-            Object l = (i == null) ? null : fieldOf(i, "l");
-            if (l == null) {
-                KaraokeLog.d("getVideoId: no response model "
-                        + "(benign early case)");
-                return null;
-            }
-        } catch (Exception e) {
-            KaraokeLog.d("getVideoId: precheck unreadable (benign)");
-            return null;
-        }
         try {
             return (String) call("patch_getVideoId",
                     new Class<?>[0], new Object[0]);
@@ -3828,22 +4046,20 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
 
     @Override
     public float speed() {
-        // v30: real playback speed, via the patch_getSpeed
-        // synthetic (renamed from patch_getVolume: it always
-        // delegated to Laiwx.a(), which returns
-        // PlaybackParameters.speed (chg.b) — proven when the
-        // mute hunt decompiled chg; the old name was the trap
-        // behind the v13 mute failure). Guarded: any
-        // failure -> 1.0.
+        // v30: real playback speed. The synthetic named
+        // patch_getVolume actually delegates to Laiwx.a(), which
+        // returns PlaybackParameters.speed (chg.b) — proven when
+        // the mute hunt decompiled chg. So the speed was on this
+        // wire all along, mislabeled. Guarded: any failure -> 1.0.
         try {
-            Object r = call("patch_getSpeed",
+            Object r = call("patch_getVolume",
                     new Class<?>[0], new Object[0]);
             float s = ((Float) r).floatValue();
             if (s > 0.0f && s <= 4.0f) {
                 if (!speedWarningLogged) {
                     speedWarningLogged = true;
                     KaraokeLog.i("speed(): player speed=" + s
-                            + " via patch_getSpeed (Laiwx a())");
+                            + " via patch_getVolume (Laiwx a())");
                 }
                 return s;
             }
@@ -3855,68 +4071,19 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
 
     // ---- KaraokeSession.MuteController ----
 
-    /** Mute outcome codes for keepMuted() (M1): the old boolean
-     *  returned true for "could not check" and "re-mute failed"
-     *  alike, so the session played on blind. Callers must
-     *  compare against these constants. */
-    public static final int KEEP_MUTED_OK = 0;
-    public static final int KEEP_MUTED_BLIND = 1;
-    public static final int KEEP_MUTED_FAILED = 2;
-
-    /** M5: forces a FRESH volume read-back, ignoring the mute
-     *  flag entirely. Returns true only if the current player
-     *  volume reads ~0 (tolerance 0.01). The session gate calls
-     *  this so a flag-only proof can never start karaoke. */
-    public static boolean verifyMuted() {
-        try {
-            float v = playerGetVolume();
-            return !Float.isNaN(v) && Math.abs(v) <= 0.01f;
-        } catch (Exception e) {
-            KaraokeLog.d("verifyMuted: read-back failed: "
-                    + e.getMessage());
-            return false;
-        }
-    }
-
     @Override
     public boolean isMuted() {
-        // Polish: the flag alone is not the truth — when it
-        // claims muted, verify against a real read-back so a
-        // drifted mute is not reported as muted. When the flag
-        // says unmuted, that is the safe direction (callers
-        // treat the video as audible), so no read is needed.
-        // A failed read-back falls back to the flag.
-        if (!muted) return false;
-        try {
-            float v = playerGetVolume();
-            return !Float.isNaN(v) && Math.abs(v) <= 0.01f;
-        } catch (Exception e) {
-            KaraokeLog.d("isMuted: read-back failed, "
-                    + "reporting flag=true");
-            return true;
-        }
+        return muted;
     }
 
     @Override
-    public boolean setMuted(boolean wantMuted) {
-        // M1/M2/M3/M5/M10 — one root cause, fixed as a unit:
-        // the old code trusted the `muted` flag. It cleared the
-        // flag BEFORE the unmute read-back (so a failed unmute
-        // poisoned every later call via the early return), saved
-        // savedVolume = 0.0 after a failed unmute, left the
-        // video silently muted on a failed mute read-back, and
-        // no-op'd on a new player when the retain had failed.
-        // Rules now: the flag is set/cleared ONLY after a
-        // verified read-back; on failure the flag and the
-        // retained player are kept, never cleared; savedVolume
-        // is never overwritten with a ~0 read.
-        //
+    public boolean setMuted(boolean muted) {
         // v44: a mute flag from a PREVIOUS player (e.g. unmute
         // failed after that player was released at song end)
         // must not short-circuit this player. If the retained
         // muted player differs from the current one, the flag
         // is stale — clear it and mute for real.
-        if (wantMuted && this.muted && mutedPlayer != null) {
+        if (muted && this.muted && mutedPlayer != null) {
             try {
                 if (resolvePlayer() != mutedPlayer) {
                     KaraokeLog.i("mute: stale flag cleared "
@@ -3928,55 +4095,17 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                         + e.getMessage());
             }
         }
-        // M10: flag true but no retained player (the retain
-        // failed at mute time) is stale too — force a real
-        // mute instead of returning true on the flag alone.
-        if (wantMuted && this.muted && mutedPlayer == null) {
-            KaraokeLog.i("mute: flag true but no retained "
-                    + "player; forcing a real mute");
-            this.muted = false;
-        }
-        // M3/M5: never early-return on the flag alone. When the
-        // flag already matches the request, verify the actual
-        // volume first; only a matching read-back is a no-op.
-        // A mismatch (drift) or an unreadable player falls
-        // through to the real (re-)apply below.
-        if (wantMuted == this.muted) {
-            try {
-                float v = playerGetVolume();
-                boolean actuallyMuted =
-                        !Float.isNaN(v) && Math.abs(v) <= 0.01f;
-                if (wantMuted == actuallyMuted) return true;
-                KaraokeLog.i("mute: flag said " + this.muted
-                        + " but volume reads " + v + "; re-applying");
-            } catch (Exception e) {
-                KaraokeLog.d("mute: verification read failed, "
-                        + "re-applying: " + e.getMessage());
-            }
-            // Force the branch below to run the real operation.
-            this.muted = !wantMuted;
-        }
+        if (muted == this.muted) return true;
         try {
-            if (wantMuted) {
+            if (muted) {
                 // v22: step logging + read-back poll. Every value is
                 // logged so the phone-side ring shows exactly which
                 // step failed (we were blind here in v21: the posted
                 // path never logged the cause).
                 float current = playerGetVolume();
-                // M2: never overwrite savedVolume with a ~0 read —
-                // a failed unmute leaves the volume at 0.0, and
-                // saving that would make the next unmute restore
-                // silence. Keep the previous value unless the
-                // pre-mute read was genuinely above ~0.
-                if (!Float.isNaN(current) && current > 0.01f) {
-                    savedVolume = current;
-                } else {
-                    KaraokeLog.i("mute step: pre-mute read " + current
-                            + " suspiciously low; keeping savedVolume="
-                            + savedVolume);
-                }
+                savedVolume = current;
                 KaraokeLog.i("mute step: thread=" + Thread.currentThread().getName()
-                        + " saved=" + savedVolume + " calling setVolume(0.0)");
+                        + " saved=" + current + " calling setVolume(0.0)");
                 playerCall("O",
                         new Class<?>[] { Float.TYPE },
                         new Object[] { Float.valueOf(0.0f) });
@@ -4000,20 +4129,7 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                 }
                 if (Float.isNaN(after) || Math.abs(after) > 0.01f) {
                     KaraokeLog.e("mute: read-back FAILED (set 0.0, saved "
-                            + savedVolume + ", read " + after + "); refusing mute");
-                    // M3: restore the saved volume BEFORE returning
-                    // false, so the video is not left silently
-                    // muted when the gate refuses.
-                    try {
-                        playerCall("O",
-                                new Class<?>[] { Float.TYPE },
-                                new Object[] { Float.valueOf(savedVolume) });
-                        KaraokeLog.i("mute: restored savedVolume="
-                                + savedVolume + " after failed mute");
-                    } catch (Exception re) {
-                        KaraokeLog.e("mute: restore after failed mute "
-                                + "threw", re);
-                    }
+                            + current + ", read " + after + "); refusing mute");
                     return false;
                 }
                 this.muted = true;
@@ -4023,7 +4139,7 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                 } catch (Exception e) {
                     KaraokeLog.e("mute: could not retain player ref", e);
                 }
-                KaraokeLog.i("mute: saved volume=" + savedVolume
+                KaraokeLog.i("mute: saved volume=" + current
                         + ", set 0.0, read back " + after
                         + " (player-internal, Media3 setVolume)");
             } else {
@@ -4035,23 +4151,13 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                     playerCallOn(targetPlayer, "O",
                             new Class<?>[] { Float.TYPE },
                             new Object[] { Float.valueOf(restore) });
-                    // M2: do NOT clear the flag before the
-                    // read-back — on mismatch the flag stays true
-                    // and the retained player is kept, so the next
-                    // call retries instead of no-op'ing.
-                    // L11: same main-thread guard as the generic
-                    // branch (no 900 ms sleep on main).
+                    this.muted = false;
                     float afterT = Float.NaN;
-                    boolean onMainT = Looper.myLooper()
-                            == Looper.getMainLooper();
-                    int triesT = onMainT ? 1 : 10;
-                    for (int i = 0; i < triesT; i++) {
+                    for (int i = 0; i < 10; i++) {
                         afterT = playerGetVolumeOf(targetPlayer);
                         if (!Float.isNaN(afterT) && Math.abs(afterT - restore) <= 0.01f) break;
-                        if (i + 1 < triesT) {
-                            try { Thread.sleep(100); }
-                            catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
-                        }
+                        try { Thread.sleep(100); }
+                        catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
                     }
                     if (Float.isNaN(afterT)
                             || Math.abs(afterT - restore) > 0.01f) {
@@ -4060,7 +4166,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                                 + afterT + "); user may still be muted");
                         return false;
                     }
-                    this.muted = false;
                     mutedPlayer = null;
                     KaraokeLog.i("unmute: restored volume=" + restore
                             + ", read back " + afterT + " (muted player)");
@@ -4069,8 +4174,7 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                 playerCall("O",
                         new Class<?>[] { Float.TYPE },
                         new Object[] { Float.valueOf(restore) });
-                // M2: flag clears only after the verified
-                // read-back below, not before it.
+                this.muted = false;
                 // v22: same poll treatment on the unmute read-back so
                 // cleanup reports the true state instead of one sample.
                 float after = Float.NaN;
@@ -4089,13 +4193,11 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
                     // Cleanup must not throw, but a failed unmute
                     // leaves the user muted: log it LOUDLY and
                     // report false so the session logs it too.
-                    // The flag stays true so the next call retries.
                     KaraokeLog.e("unmute: read-back MISMATCH "
                             + "(restored " + restore + ", read "
                             + after + "); user may still be muted");
                     return false;
                 }
-                this.muted = false;
                 KaraokeLog.i("unmute: restored volume=" + restore
                         + ", read back " + after);
             }
@@ -4103,14 +4205,18 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         } catch (Exception e) {
             // Trace already logged by call(); this line records the
             // outcome so the session's refusal is understandable.
-            KaraokeLog.e("KaraokeBridge: setMuted(" + wantMuted
+            KaraokeLog.e("KaraokeBridge: setMuted(" + muted
                     + ") failed; muted stays " + this.muted);
-            // M2: on failure the flag and the retained player are
-            // KEPT (a failed unmute keeps muted=true so the next
-            // call retries; a failed mute never set the flag).
-            // The old v44 code cleared both here, which poisoned
-            // later sessions with a stuck-muted user and a
-            // savedVolume of 0.0.
+            // v44: a failed UNMUTE must not poison later sessions
+            // with a stuck flag (seen at song-end DONE: the old
+            // player was already released). Clear flag + ref;
+            // the return stays false so cleanup logs honestly.
+            if (!muted) {
+                this.muted = false;
+                mutedPlayer = null;
+                KaraokeLog.e("unmute: cleared stale mute flag "
+                        + "after failure");
+            }
             return false;
         }
     }
@@ -4121,51 +4227,47 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
      *  or reset the volume, returning the ORIGINAL audio
      *  mid-song while `muted` still says true. Re-mutes on any
      *  drift. Silent when healthy; loud on repair. Never
-     *  throws. M1: tri-state — OK only on a verified ~0
-     *  read-back, BLIND when the player is unresolvable or the
-     *  read-back is unavailable, FAILED when the read-back shows
-     *  volume NOT ~0 and the re-mute fails. (The old boolean
-     *  returned true for all three blind/failed cases.) */
+     *  throws, never fails the session. */
     @Override
-    public int keepMuted() {
+    public boolean keepMuted() {
         try {
             if (!muted) {
                 KaraokeLog.i("mute guard: flag false during"
                         + " PLAYING, re-muting");
-                return setMuted(true) ? KEEP_MUTED_OK : KEEP_MUTED_FAILED;
+                return setMuted(true);
             }
             Object cur;
             try {
                 cur = resolvePlayer();
             } catch (Exception e) {
                 KaraokeLog.d("mute guard: player unresolvable,"
-                        + " blind");
-                return KEEP_MUTED_BLIND;
+                        + " skipping check");
+                return true;
             }
             if (cur != mutedPlayer) {
                 KaraokeLog.i("mute guard: player recreated"
                         + " (stutter), re-muting");
                 muted = false;
-                return setMuted(true) ? KEEP_MUTED_OK : KEEP_MUTED_FAILED;
+                return setMuted(true);
             }
             float v;
             try {
                 v = playerGetVolumeOf(cur);
             } catch (Exception e) {
                 KaraokeLog.d("mute guard: read-back unavailable,"
-                        + " blind");
-                return KEEP_MUTED_BLIND;
+                        + " skipping check");
+                return true;
             }
             if (Float.isNaN(v) || Math.abs(v) > 0.01f) {
                 KaraokeLog.i("mute guard: volume drifted to " + v
                         + ", re-muting");
                 muted = false;
-                return setMuted(true) ? KEEP_MUTED_OK : KEEP_MUTED_FAILED;
+                return setMuted(true);
             }
-            return KEEP_MUTED_OK;
+            return true;
         } catch (Exception e) {
-            KaraokeLog.w("mute guard: check failed, blind", e);
-            return KEEP_MUTED_BLIND;
+            KaraokeLog.w("mute guard: check failed, skipping", e);
+            return true;
         }
     }
 
@@ -4175,19 +4277,6 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
     public void onState(KaraokeSession.State state) {
         KaraokeLog.i("session state -> " + state);
         refreshKButton();
-        // Polish: PLAYING means the last failure is stale —
-        // clear it so the next log share does not blame an old
-        // failure for a healthy song.
-        if (state == KaraokeSession.State.PLAYING) {
-            KaraokeLog.clearLastFailure();
-        }
-        // L1: karaoke inactive (stopped / done / errored) — the
-        // align guard stops its 500 ms decor traversal.
-        if (state == KaraokeSession.State.IDLE
-                || state == KaraokeSession.State.DONE
-                || state == KaraokeSession.State.ERROR) {
-            stopVideoAlignGuard();
-        }
         // v13 loading overlay (prepare veil): show while
         // loading (CONNECTING/BUFFERING), hide on every exit
         // (PLAYING, ERROR, DONE, IDLE). PAUSED is the mirrored
@@ -4197,15 +4286,14 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         if (state == KaraokeSession.State.CONNECTING
                 || state == KaraokeSession.State.BUFFERING) {
             showLoadingOverlay();
-            // L6: arm the veil's own 30s timeout (tied to the
-            // session's load watchdog); hideLoadingOverlay()
-            // cancels it on every exit path.
-            scheduleVeilTimeout();
         } else {
             hideLoadingOverlay();
         }
         if (state == KaraokeSession.State.DONE) {
             resetBvToDefault();
+        }
+        if (state == KaraokeSession.State.PLAYING) {
+            updateSeekbarFromAnchor();
         }
     }
 
@@ -4219,12 +4307,32 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
         hideLoadingOverlay();
         resetBvToDefault();
         // v54 Q31: fixed short toast (details stay in the log).
-        toast("karaoke failed — tap K to retry", true);
+        toast("karaoke failed restart the app", true);
     }
 
     @Override
     public void onFirstAudio() {
         KaraokeLog.i("first karaoke audio (mute + skip + hold release done)");
+        updateSeekbarFromAnchor();
+    }
+
+    /** Seek-bar updates from session callbacks (main thread). */
+    private static void updateSeekbarFromAnchor() {
+        try {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                try {
+                    View anchor = anchorViewForOverlay();
+                    View root = anchor != null
+                            ? anchor.getRootView() : null;
+                    if (root != null) {
+                        updateKaraokeSeekbar(root);
+                        updateKaraokeSeekbarActual(root);
+                    }
+                } catch (Exception ignored) {
+                }
+            });
+        } catch (Exception ignored) {
+        }
     }
 
     // ---- v54 progress / rebuffer / sticky callbacks ----
@@ -4297,14 +4405,10 @@ public class KaraokeBridge implements KaraokeSession.VideoPosition,
             // switch path calls from the OLD session's dying sync
             // worker (interrupted): every main-latch call in the
             // new start (pause/pre-mute/cpn) failed "interrupted"
-            // in the v57 log. L2: post to the main thread instead
-            // of a fresh thread — restartForVideo() re-checks
-            // karaokeSticky + session liveness immediately before
-            // starting, so a K tap in between cannot resurrect
-            // karaoke after K-off.
+            // in the v57 log. A fresh thread is clean.
             final String target = newVideoId;
-            new Handler(Looper.getMainLooper()).post(() ->
-                    restartForVideo(target, "sync-switch"));
+            new Thread(() -> restartForVideo(target, "sync-switch"),
+                    "karaoke-restart").start();
         } else {
             if (session != null) {
                 try {

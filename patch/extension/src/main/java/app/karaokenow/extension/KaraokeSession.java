@@ -68,17 +68,14 @@ public class KaraokeSession implements KaraokePlayer.Listener {
     }
 
     /** Video-side facts the patch wires to real player hooks.
-     *  Wired by KaraokeBridge to Laiwx synthetics: position via
-     *  patch_getPosition = e(), playing state via
-     *  patch_isPlaying = Q(), speed via patch_getSpeed = a()
-     *  (PlaybackParameters.speed — the old patch_getVolume name
-     *  lied; a() returns speed, not volume). pause()/resume()
-     *  drive the app's own pause/resume path via Laiwx.ar(Z, Z)
-     *  — ar(false, true) pauses, ar(true, true) resumes. The
-     *  v13 patch_pause/patch_resume -> M(Z)V synthetics only
-     *  wrote a field that was already false, so they no-op'd
-     *  and are dead. Each returns true if the call went
-     *  through, false if it could not be made (never throws). */
+     *  Wired by KaraokeBridge to Laiwx synthetics (patch_getPosition
+     *  = e(), patch_isPlaying = Q()). speed() has no identified
+     *  Laiwx source yet (UNVERIFIED): the bridge returns 1.0f.
+     *  pause()/resume() are v13, wired to patch_pause /
+     *  patch_resume (Laiwx.M(Z)V -> ExoPlayer.ab(Z)V, the
+     *  playWhenReady setter — opcode-verified, see the patch
+     *  file). Each returns true if the call went through,
+     *  false if it could not be made (never throws). */
     public interface VideoPosition {
         long positionMs();
         boolean isPlaying();
@@ -98,15 +95,11 @@ public class KaraokeSession implements KaraokePlayer.Listener {
         String videoId();
     }
 
-    /** Mute control for YouTube's own player. Wired by
-     *  KaraokeBridge to the player itself: volume is set via
-     *  the player's O(float) method and read back from its
-     *  `ae` field. (The old patch_getVolume = a() /
-     *  patch_setVolume = L() wiring was wrong — a() returns
-     *  speed, and L() routes through as(), which cannot take
-     *  0.0f.) A controller that reports false blocks karaoke
-     *  start by design (safe default: no mute proof, no
-     *  karaoke audio, never both audios). */
+    /** Mute control for YouTube's own player. Wired by KaraokeBridge
+     *  to Laiwx synthetics (patch_getVolume = a(), patch_setVolume
+     *  = L()). A controller that reports false blocks karaoke start
+     *  by design (safe default: no mute proof, no karaoke audio,
+     *  never both audios). */
     public interface MuteController {
         boolean isMuted();
         /** Returns true if the mute actually took effect. */
@@ -116,14 +109,9 @@ public class KaraokeSession implements KaraokePlayer.Listener {
          *  NEW internal player (full volume) or reset the
          *  volume — either returns the ORIGINAL audio mid-song.
          *  syncTick calls this every 500ms during PLAYING.
-         *  Returns a KaraokeBridge tri-state:
-         *  KEEP_MUTED_OK (verified ~0), KEEP_MUTED_BLIND
-         *  (player unresolvable or read-back unavailable —
-         *  could not verify), KEEP_MUTED_FAILED (verified NOT
-         *  muted / re-mute failed). Never throws. The session
-         *  fails after 2 consecutive FAILED results or 20
-         *  consecutive BLIND ticks. */
-        int keepMuted();
+         *  Silent when healthy; never throws, never fails the
+         *  session (a blind window just skips one check). */
+        boolean keepMuted();
     }
 
     // Drift loop, from the plan: poll ~2x/s; <80 ms ignore;
@@ -170,11 +158,9 @@ public class KaraokeSession implements KaraokePlayer.Listener {
      *  session did not pause. */
     private boolean pausedByKaraoke;
     /** v27: what the (unreliable) isPlaying flag said at start.
-     *  Diagnostic only now (logged at start): cleanup resumes
-     *  on pausedByKaraoke, not on this flag — Q() proved
-     *  unreliable (false while playing), so gating cleanup on
-     *  it could strand a video the session had paused. The
-     *  gate still always resumes once karaoke is ready (a K
+     *  Cleanup restores the video only if it was playing — a
+     *  pre-paused video is never auto-resumed on failure paths.
+     *  The gate still always resumes once karaoke is ready (a K
      *  tap means play karaoke). */
     private boolean wasPlayingFlag;
     /** True while karaoke is held (paused) because it runs ahead
@@ -184,41 +170,18 @@ public class KaraokeSession implements KaraokePlayer.Listener {
     private boolean holdingForSync;
     /** Last mirrored video playing state, for transition-only logs. */
     private Boolean lastMirroredPlaying;
-    /** M1: consecutive sync ticks where keepMuted() reported
-     *  FAILED (verified not muted) / BLIND (unverifiable).
-     *  The session fails after 2 FAILED or 20 BLIND in a row;
-     *  either counter resets on OK (a tick of the other kind
-     *  also breaks the streak). */
-    private int consecutiveMuteFailures;
-    private int consecutiveMuteBlindTicks;
-    /** M9: consecutive sync ticks aborted by a failed
-     *  position/playing-state read. Fails after 4. */
-    private int consecutiveTickFailures;
-    /** M11: last plausible speed read (1.0 = normal). A failed
-     *  or implausible speed() read reuses this instead of
-     *  falling back to 1.0; speedUncertain suppresses the
-     *  hard-seek while the read is bad. */
-    private float lastGoodSpeed = 1.0f;
-    private boolean speedUncertain;
-    /** M12: true while this session paused the video for a
-     *  rebuffer or a drained reconnect (separate from
-     *  pausedByKaraoke, which only covers the start pause).
-     *  stopInternal() resumes the video when it is set. */
-    private boolean pausedForRebuffer;
-    /** M8: last positionMs() value seen by syncTick (-2 = no
-     *  reading yet) and the tick it last changed on. A
-     *  "playback gone" tick only counts when the position is
-     *  also unchanged/negative — Q() == false alone never
-     *  stops karaoke. */
-    private long lastPositionMs = -2;
-    private long lastPositionChangeTick = -1;
-    private long syncTickCount;
 
     /** Stage-2 toggle: the server streams a real backing-
      *  vocal stem beside the instrumental, and the player mixes
      *  it live when this is on. Stored here so the player can be
      *  switched mid-song with no re-request. */
     private volatile boolean backingVocalsEnabled;
+    /** Instrumental key shift in semitones, 0 = original. */
+    private volatile int keySemitones = 0;
+    /** Song's vocal tessitura from the server (null until it lands). */
+    private volatile KaraokeVoiceProfile songProfile;
+    /** Singer's own comfortable centre from the last "My key" test. */
+    private volatile KaraokeVoiceProfile userProfile;
 
     public KaraokeSession(KaraokeSettings settings, VideoPosition video,
             MuteController mute, Listener listener) {
@@ -252,7 +215,6 @@ public class KaraokeSession implements KaraokePlayer.Listener {
             KaraokeLog.w("session start ignored: already " + state);
             return;
         }
-        KaraokeLog.clearLastFailure();
         stopInternal(false);
         this.videoId = videoId;
         this.firstAudioFired = false;
@@ -268,15 +230,6 @@ public class KaraokeSession implements KaraokePlayer.Listener {
         this.frozenTicks = 0;
         this.videoStalled = false;
         this.blindTicks = 0;
-        this.consecutiveMuteFailures = 0;
-        this.consecutiveMuteBlindTicks = 0;
-        this.consecutiveTickFailures = 0;
-        this.lastGoodSpeed = 1.0f;
-        this.speedUncertain = false;
-        this.pausedForRebuffer = false;
-        this.lastPositionMs = -2;
-        this.lastPositionChangeTick = -1;
-        this.syncTickCount = 0;
         this.lastHardSeekMs = 0;
         this.streamCut = false;
         this.videoMismatchTicks = 0;
@@ -307,18 +260,14 @@ public class KaraokeSession implements KaraokePlayer.Listener {
         // veil): pause the video now, show the loading overlay
         // (via onState(CONNECTING) in the bridge), and resume
         // ONLY when vocal-removed audio is ready (the
-        // first-audio gate). M4: a pause failure is NOT
-        // silently tolerated — if pause() returns false or
-        // throws, pre-mute immediately (with read-back) so the
-        // original cannot play during load; if the pre-mute
-        // also fails, the session fails honestly instead of
-        // starting unmuted.
+        // first-audio gate). A pause failure is NOT a session
+        // failure: the video keeps playing muted during load
+        // instead, and the gate still fires on queued audio.
         // v27: ALWAYS attempt pause (result James wants: picture
         // stops at tap, resumes with karaoke). The isPlaying flag
         // proved unreliable (false while playing), so the ACTION
-        // no longer depends on it — ar(false) no-ops if already
-        // paused. wasPlayingFlag only records what Q() said
-        // (diagnostic); cleanup resumes on pausedByKaraoke.
+        // no longer depends on it — M(false) no-ops if already
+        // paused. wasPlayingFlag only decides cleanup politeness.
         try {
             try {
                 wasPlayingFlag = video.isPlaying();
@@ -331,25 +280,8 @@ public class KaraokeSession implements KaraokePlayer.Listener {
                     + " (flag said playing=" + wasPlayingFlag + ")");
         } catch (Exception e) {
             pausedByKaraoke = false;
-            KaraokeLog.e("session start: pause threw", e);
-        }
-        if (!pausedByKaraoke) {
-            // M4: video still playing (or pause state unknown)
-            // — mute NOW so the load cannot play the original.
-            boolean preMuted = false;
-            try {
-                preMuted = mute != null && mute.setMuted(true);
-            } catch (Exception e) {
-                KaraokeLog.e("session start: pre-mute threw", e);
-            }
-            KaraokeLog.i("session start: pause failed, pre-mute result="
-                    + preMuted);
-            if (!preMuted) {
-                fail("Video would not pause and pre-mute failed; "
-                        + "karaoke refused rather than risk the "
-                        + "original audio during load");
-                return;
-            }
+            KaraokeLog.e("session start: pause threw, "
+                    + "continuing without pause", e);
         }
         player = new KaraokePlayer(this);
         player.setBackingVocalsEnabled(backingVocalsEnabled);
@@ -359,9 +291,6 @@ public class KaraokeSession implements KaraokePlayer.Listener {
         // order. Nothing audible plays before the mute.
         player.start();
         client = new KaraokeWsClient(settings.wsUrl, new WsListener(wsGen));
-        // Server API key (keyed endpoints only): sent in the WS
-        // hello as "key" when saved; null = keyless. Never logged.
-        client.apiKey = settings.modalKey;
         // v29: hand the server the app's own audio URL (route
         // selection at start, visible in the log; a failed range
         // on it still stops — no silent second source).
@@ -400,13 +329,13 @@ public class KaraokeSession implements KaraokePlayer.Listener {
         start(videoId);
     }
 
-    public synchronized void stop() {
+    public void stop() {
         KaraokeLog.i("session stop requested (state=" + state + ")");
         stopInternal(true);
         setState(State.IDLE);
     }
 
-    private synchronized void stopInternal(boolean unmute) {
+    private void stopInternal(boolean unmute) {
         stopping = true;
         stopReconnect();
         if (syncTask != null) syncTask.cancel(false);
@@ -457,16 +386,11 @@ public class KaraokeSession implements KaraokePlayer.Listener {
                 KaraokeLog.e("session cleanup unmute threw", e);
             }
         }
-        // M8/M12: resume the video iff THIS session paused it —
-        // the start pause (pausedByKaraoke) or a rebuffer /
-        // drained-reconnect pause (pausedForRebuffer). The old
-        // gate used wasPlayingFlag, a Q() snapshot taken at
-        // start; Q() proved unreliable (false while playing),
-        // so it could strand a video the session had paused.
+        // v27: restore only if the video was playing at tap —
+        // never auto-resume a pre-paused video on failure paths.
         // (The success gate always resumes: a K tap means play.)
-        if (pausedByKaraoke || pausedForRebuffer) {
+        if (pausedByKaraoke && wasPlayingFlag) {
             pausedByKaraoke = false;
-            pausedForRebuffer = false;
             try {
                 boolean resumed = video.resume();
                 KaraokeLog.i("session cleanup video resume: result="
@@ -477,7 +401,7 @@ public class KaraokeSession implements KaraokePlayer.Listener {
         }
     }
 
-    private synchronized void fail(String message) {
+    private void fail(String message) {
         if (stopping) return;
         KaraokeLog.e("session FAIL: " + message + " | " + snapshot());
         stopInternal(true);
@@ -536,6 +460,84 @@ public class KaraokeSession implements KaraokePlayer.Listener {
         return backingVocalsEnabled;
     }
 
+    // ---- key change ----
+
+    /**
+     * Shift the instrumental by {@code semitones} (0 = original key).
+     * Live-safe and mid-song: the player's DSP stage takes it on the
+     * next block, with no re-request, no re-download and no desync,
+     * because pitch-only shifting leaves the duration unchanged.
+     */
+    public void setKeySemitones(int semitones) {
+        int folded = KaraokeVoiceProfile.fold(semitones);
+        keySemitones = folded;
+        KaraokePlayer p = player;
+        if (p != null) p.setKeySemitones(folded);
+        KaraokeLog.i("key set to " + KaraokeVoiceProfile.semitoneLabel(folded)
+                + (KaraokeVoiceProfile.isLargeShift(folded)
+                ? " (large shift)" : ""));
+    }
+
+    public int getKeySemitones() {
+        return keySemitones;
+    }
+
+    /** Song's vocal profile from the server, or null if not sent yet. */
+    public void setSongProfile(KaraokeVoiceProfile profile) {
+        songProfile = profile;
+        if (profile != null) {
+            KaraokeLog.i("key: song profile centre="
+                    + Math.round(profile.center) + " cents ("
+                    + KaraokePitchDetector.noteName(profile.center) + ")"
+                    + " frames=" + profile.voicedFrames);
+        }
+    }
+
+    public KaraokeVoiceProfile getSongProfile() {
+        return songProfile;
+    }
+
+    /** Store the singer's measured profile (from the 10 s test). */
+    public void setUserProfile(KaraokeVoiceProfile profile) {
+        userProfile = profile;
+    }
+
+    public KaraokeVoiceProfile getUserProfile() {
+        return userProfile;
+    }
+
+    /** Best auto key for this singer/song, or 0 when unknown. */
+    public int suggestKey() {
+        KaraokeVoiceProfile u = userProfile;
+        if (u == null) return 0;
+        return u.suggestedSemitones(songProfile);
+    }
+
+    /** Instrumental centre from the server's vocal profile, or null. */
+    public static KaraokeVoiceProfile songProfileFromHeader(
+            org.json.JSONObject header) {
+        if (header == null) return null;
+        org.json.JSONObject vp = header.optJSONObject("vocal_profile");
+        if (vp == null) return null;
+        double c = vp.optDouble("center_cents", Double.NaN);
+        if (Double.isNaN(c)) return null;
+        return KaraokeVoiceProfile.ofCenter(c);
+    }
+
+    /** Furthest decoded karaoke (vocal-removed) second held,
+     *  for the light-blue buffered seek bar. -1 when none. */
+    public double bufferedEndSec() {
+        KaraokePlayer p = player;
+        return p == null ? -1 : p.coverageEndSec();
+    }
+
+    /** Whole instant-karaoke range {startSec, endSec} (cached,
+     *  instant-seekable), for the seek bar's cache line. */
+    public double[] karaokeCachedCoverage() {
+        KaraokePlayer p = player;
+        return p == null ? null : p.cachedCoverageSec();
+    }
+
     /**
      * v26: first-audio gate, extracted from onChunk so decode
      * completions can re-fire it. Decode finishes AFTER arrival
@@ -574,20 +576,9 @@ public class KaraokeSession implements KaraokePlayer.Listener {
             } catch (Exception e) {
                 KaraokeLog.e("first-audio mute call threw", e);
             }
-            // M5: flag-only is not proof — force a fresh volume
-            // read-back (a sticky restart can reach here with a
-            // stale muted flag while the volume is actually up).
-            boolean verified = false;
-            try {
-                verified = KaraokeBridge.verifyMuted();
-            } catch (Exception e) {
-                KaraokeLog.e("first-audio mute verify threw", e);
-            }
-            KaraokeLog.i("first-audio gate: mute result=" + muted
-                    + " verified=" + verified);
-            if (!muted || !verified) {
-                fail("Mute did not take effect (verified="
-                        + verified + "); karaoke refused "
+            KaraokeLog.i("first-audio gate: mute result=" + muted);
+            if (!muted) {
+                fail("Mute did not take effect; karaoke refused "
                         + "to start rather than play over the "
                         + "original audio.");
                 return;
@@ -614,40 +605,19 @@ public class KaraokeSession implements KaraokePlayer.Listener {
             KaraokeLog.i("first-audio gate: skipping karaoke to "
                     + String.format("%.2f", atSec) + "s");
             if (atSec > 0) player.skipToSec(atSec);
-            // M10: resume the VIDEO before releasing karaoke
-            // audio — releasing first plays karaoke over a
-            // still-paused video, and a failed resume used to
-            // be ignored. A failed resume keeps the hold and
-            // fails the session instead.
+            player.releaseHold();
+            setState(State.PLAYING);
             if (pausedByKaraoke) {
-                boolean resumed = false;
+                pausedByKaraoke = false;
                 try {
-                    resumed = video.resume();
+                    boolean resumed = video.resume();
                     KaraokeLog.i("first-audio gate: video resume "
                             + "result=" + resumed);
                 } catch (Exception e) {
                     KaraokeLog.e("first-audio video resume threw",
                             e);
                 }
-                if (!resumed) {
-                    fail("Video resume failed at first audio; "
-                            + "karaoke held, not released");
-                    return;
-                }
-                pausedByKaraoke = false;
             }
-            // M7: re-check before releasing — a stop() between
-            // the mute and here must not resurrect PLAYING.
-            if (stopping || player == null
-                    || (state != State.CONNECTING
-                            && state != State.BUFFERING)) {
-                KaraokeLog.i("first-audio gate: stopped while "
-                        + "gating (state=" + state
-                        + "); hold not released");
-                return;
-            }
-            player.releaseHold();
-            setState(State.PLAYING);
             listener.onFirstAudio();
             startSyncLoop();
         }
@@ -682,6 +652,23 @@ public class KaraokeSession implements KaraokePlayer.Listener {
         private boolean stale() {
             return gen != wsGen;
         }
+        @Override
+        public void onVocalProfile(double centerCents) {
+            if (stale()) return;
+            setSongProfile(KaraokeVoiceProfile.ofCenter(centerCents));
+            // If the user already did "My key" before the profile
+            // landed, apply the suggestion now rather than making
+            // them repeat the test.
+            KaraokeVoiceProfile user = userProfile;
+            if (user != null) {
+                int s = user.suggestedSemitones(songProfile);
+                setKeySemitones(s);
+                KaraokeLog.i("key: auto-applied "
+                        + KaraokeVoiceProfile.semitoneLabel(s)
+                        + " from a late vocal_profile");
+            }
+        }
+
         @Override
         public void onHeader(int sr, boolean coldStart, boolean cached) {
             if (stale()) return;
@@ -914,68 +901,7 @@ public class KaraokeSession implements KaraokePlayer.Listener {
             return;
         }
         long nowMs = System.currentTimeMillis();
-        // M1/M8: mute guard runs FIRST on every tick, before any
-        // early return below — background play (position -1)
-        // used to return before the guard, leaving karaoke
-        // running with no mute check at all. v53: a video
-        // stutter can recreate the internal player (full
-        // volume) or reset its volume, returning the ORIGINAL
-        // audio mid-song. Tri-state: OK resets both counters;
-        // FAILED fails after 2 in a row; BLIND (could not
-        // verify) fails after 20 in a row (~10s).
-        if (mute != null) {
-            int guardResult;
-            try {
-                guardResult = mute.keepMuted();
-            } catch (Exception e) {
-                KaraokeLog.w("sync: mute guard threw", e);
-                guardResult = KaraokeBridge.KEEP_MUTED_BLIND;
-            }
-            if (guardResult == KaraokeBridge.KEEP_MUTED_OK) {
-                consecutiveMuteFailures = 0;
-                consecutiveMuteBlindTicks = 0;
-            } else if (guardResult
-                    == KaraokeBridge.KEEP_MUTED_FAILED) {
-                consecutiveMuteBlindTicks = 0;
-                if (++consecutiveMuteFailures >= 2) {
-                    KaraokeLog.e("sync: mute guard failed re-mute "
-                            + consecutiveMuteFailures
-                            + " ticks in a row");
-                    fail("Original audio unmuted itself and could "
-                            + "not be re-muted");
-                    return;
-                }
-                KaraokeLog.w("sync: mute guard re-mute failed ("
-                        + consecutiveMuteFailures + " in a row)");
-            } else {
-                // BLIND (or any unexpected value): unverifiable.
-                consecutiveMuteFailures = 0;
-                if (++consecutiveMuteBlindTicks >= 20) {
-                    KaraokeLog.e("sync: mute guard blind "
-                            + consecutiveMuteBlindTicks
-                            + " ticks in a row");
-                    fail("Original-audio mute state unverifiable "
-                            + "for 10s");
-                    return;
-                }
-                KaraokeLog.w("sync: mute guard blind ("
-                        + consecutiveMuteBlindTicks + " in a row)");
-            }
-        }
-        // M9: guard each reflection read — a transient failure
-        // skips the tick instead of failing the whole session
-        // (the startSyncLoop catch used to fail on any throw).
-        syncTickCount++;
-        long vPos;
-        try {
-            vPos = video.positionMs();
-        } catch (Exception e) {
-            KaraokeLog.w("sync: position read threw", e);
-            if (++consecutiveTickFailures >= 4) {
-                fail("Video position unreadable 4 ticks in a row");
-            }
-            return;
-        }
+        long vPos = video.positionMs();
         // v44 playback-gone watchdog: position -1 means the
         // response model/player is gone (miniplayer removed,
         // watch closed). Sustained 2s -> stop instead of
@@ -986,27 +912,10 @@ public class KaraokeSession implements KaraokePlayer.Listener {
             // is ALIVE, keep karaoke going (no position logic
             // this tick). Only a -1 that is also NOT playing
             // (closed/released player) stops after 2s.
-            // M8: Q() == false alone never stops karaoke — the
-            // position must also be unchanged (still -1, not a
-            // first -1 tick after valid positions, which is a
-            // transient detach and does not count).
-            boolean posUnchanged = (vPos == lastPositionMs);
-            if (!posUnchanged) {
-                lastPositionMs = vPos;
-                lastPositionChangeTick = syncTickCount;
-                goneTicks = 0;
-                return;
-            }
             boolean bgPlaying = false;
             try {
                 bgPlaying = video.isPlaying();
-            } catch (Exception e) {
-                KaraokeLog.w("sync: isPlaying read threw", e);
-                if (++consecutiveTickFailures >= 4) {
-                    fail("Video playing-state unreadable "
-                            + "4 ticks in a row");
-                }
-                return;
+            } catch (Exception ignored) {
             }
             if (bgPlaying) {
                 goneTicks = 0;
@@ -1014,51 +923,27 @@ public class KaraokeSession implements KaraokePlayer.Listener {
             }
             if (++goneTicks >= 4) {
                 KaraokeLog.i("sync: playback context gone "
-                        + "(position -1, unchanged); stopping karaoke");
+                        + "(position -1); stopping karaoke");
                 stop();
             }
             return;
         }
-        if (vPos != lastPositionMs) {
-            lastPositionMs = vPos;
-            lastPositionChangeTick = syncTickCount;
-        }
         goneTicks = 0;
-        boolean vPlaying;
+        // v53 mute guard: a video stutter can recreate the
+        // internal player (full volume) or reset its volume,
+        // returning the ORIGINAL audio mid-song. Repair it
+        // here, every 500ms, on every PLAYING sub-path (stall
+        // hold, mirror pause, drift loop). Silent when healthy.
         try {
-            vPlaying = video.isPlaying();
-        } catch (Exception e) {
-            KaraokeLog.w("sync: isPlaying read threw", e);
-            if (++consecutiveTickFailures >= 4) {
-                fail("Video playing-state unreadable 4 ticks in a row");
-            }
-            return;
-        }
-        // M11: cache the last good speed — a transient read
-        // failure used to fall back to 1.0, which made karaoke
-        // fall behind ~1s/s at 2x and hard-seek every 1.5s.
-        // An implausible value (<= 0 or > 4x) is treated as a
-        // failed read; the cache only updates on good reads.
-        float vSpeed;
-        try {
-            float s = video.speed();
-            if (s > 0 && s <= 4.0f) {
-                vSpeed = s;
-                lastGoodSpeed = s;
-                speedUncertain = false;
-            } else {
-                vSpeed = lastGoodSpeed;
-                speedUncertain = true;
-                KaraokeLog.w("sync: implausible speed " + s
-                        + ", using last good " + lastGoodSpeed);
+            if (mute != null && !mute.keepMuted()) {
+                KaraokeLog.w("sync: mute guard could not"
+                        + " re-assert mute");
             }
         } catch (Exception e) {
-            vSpeed = lastGoodSpeed;
-            speedUncertain = true;
-            KaraokeLog.w("sync: speed read threw, using last good "
-                    + lastGoodSpeed, e);
+            KaraokeLog.w("sync: mute guard threw", e);
         }
-        consecutiveTickFailures = 0;
+        boolean vPlaying = video.isPlaying();
+        float vSpeed = video.speed() > 0 ? video.speed() : 1.0f;
         // v54 rebuffer / reconnect pre-emption (before stall
         // mirror and drift: positions diverge by design here).
         if (rebuffering) {
@@ -1072,19 +957,9 @@ public class KaraokeSession implements KaraokePlayer.Listener {
                 // Buffer ran out: park the video on the veil
                 // until coverage returns.
                 showReconnectVeil();
-                // M12: track the pause (flag) and log a
-                // failure — a false return used to be swallowed.
                 try {
-                    boolean paused = video.pause();
-                    pausedForRebuffer = paused;
-                    if (!paused) {
-                        KaraokeLog.w("sync: reconnect drained "
-                                + "video pause returned false");
-                    }
-                } catch (Exception e) {
-                    pausedForRebuffer = false;
-                    KaraokeLog.w("sync: reconnect drained "
-                            + "video pause threw", e);
+                    video.pause();
+                } catch (Exception ignored) {
                 }
                 player.pause();
                 emitReconnectProgress();
@@ -1225,13 +1100,7 @@ public class KaraokeSession implements KaraokePlayer.Listener {
             // v57: never undo a pending-seek pause — the mirror
             // resumed karaoke 0.5s after every seek started,
             // playing stale audio at the old position.
-            // M6: never undo a drift hold either. Verified
-            // against KaraokePlayer.resume(): it is a plain
-            // unpause (paused=false + track.play(), no hold
-            // check), so resuming here every tick defeated the
-            // hold below; the holding branch re-pauses while
-            // still ahead.
-            if (pendingSeekValueMs < 0 && !holdingForSync) {
+            if (pendingSeekValueMs < 0) {
                 player.resume();
             }
         }
@@ -1249,10 +1118,6 @@ public class KaraokeSession implements KaraokePlayer.Listener {
                         + "ms back in band -> resume karaoke");
                 holdingForSync = false;
                 player.resume();
-            } else {
-                // M6: still ahead — re-assert the hold. The
-                // mirror above runs before this check each tick.
-                player.pause();
             }
             return;
         }
@@ -1267,20 +1132,11 @@ public class KaraokeSession implements KaraokePlayer.Listener {
             // (dropping samples keeps pitch exact). Cooldown so
             // back-to-back seeks cannot chatter while the track
             // buffer still holds pre-skip audio.
-            // M11: never hard-seek while the speed is uncertain —
-            // a stale 1.0 fallback at 2x made karaoke fall
-            // behind ~1s/s and seek every 1.5s.
-            if (!speedUncertain
-                    && (nowMs - lastHardSeekMs >= 1500
-                            || driftMs > 1200)) {
+            if (nowMs - lastHardSeekMs >= 1500 || driftMs > 1200) {
                 KaraokeLog.i("sync: drift +" + driftMs
                         + "ms behind -> hard-seek karaoke to " + vPos + "ms");
                 player.skipToSec(vPos / 1000.0);
                 lastHardSeekMs = nowMs;
-            } else if (speedUncertain) {
-                KaraokeLog.d("sync: drift +" + driftMs
-                        + "ms behind but speed uncertain — "
-                        + "skipping hard-seek");
             }
         } else if (driftMs < -SEEK_MS) {
             // Karaoke ahead: hold paused until video catches up.
@@ -1331,22 +1187,12 @@ public class KaraokeSession implements KaraokePlayer.Listener {
     /** v54 Q10: a completed seek ALWAYS resumes video + karaoke,
      *  even when the video was paused before the seek. */
     private void resumeVideoAndAudio(String why) {
-        // M10: video first; a failed video resume must NOT
-        // unpause karaoke audio underneath a stuck video —
-        // keep it paused and fail honestly instead.
-        boolean resumed = false;
         try {
-            resumed = video.resume();
-            KaraokeLog.i("sync: " + why + " resume video result=" + resumed);
+            boolean r = video.resume();
+            KaraokeLog.i("sync: " + why + " resume video result=" + r);
         } catch (Exception e) {
             KaraokeLog.e("sync: " + why + " video resume threw", e);
         }
-        if (!resumed) {
-            fail("Video resume failed after " + why
-                    + "; karaoke kept paused rather than released");
-            return;
-        }
-        pausedForRebuffer = false;
         lastMirroredPlaying = true;
         player.resume();
     }
@@ -1355,20 +1201,11 @@ public class KaraokeSession implements KaraokePlayer.Listener {
         rebuffering = true;
         rebufferTargetSec = targetSec;
         rebufferStartMs = System.currentTimeMillis();
-        // M12: track the pause (flag) and log a failure — a
-        // false return used to be swallowed, and the flag is
-        // what resumes the video on the 60s-timeout fail path.
-        boolean paused = false;
         try {
-            paused = video.pause();
-            KaraokeLog.i("sync: rebuffer video pause result=" + paused);
-            if (!paused) {
-                KaraokeLog.w("sync: rebuffer video pause returned false");
-            }
+            video.pause();
         } catch (Exception e) {
             KaraokeLog.w("rebuffer video pause threw", e);
         }
-        pausedForRebuffer = paused;
         player.pause();
         KaraokeLog.i("sync: rebuffer (" + why + ") waiting for "
                 + String.format("%.2f", targetSec) + "s");
@@ -1391,8 +1228,6 @@ public class KaraokeSession implements KaraokePlayer.Listener {
                 listener.onRebufferEnd();
             } catch (Exception ignored) {
             }
-            // M12: fail() -> stopInternal() resumes the video
-            // if pausedForRebuffer is set.
             fail("Rebuffer timed out waiting for audio");
             return;
         }
@@ -1538,7 +1373,6 @@ public class KaraokeSession implements KaraokePlayer.Listener {
                     + " from seq=" + resumeSeq);
             KaraokeWsClient next = new KaraokeWsClient(
                     settings.wsUrl, new WsListener(++wsGen));
-            next.apiKey = settings.modalKey;
             next.resumeFromSeq = resumeSeq;
             try {
                 next.connect(videoId, null, 0);

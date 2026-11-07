@@ -121,31 +121,21 @@ public class KaraokePlayer {
     }
     private final java.util.HashMap<Integer, CachedOpus> opusCache =
             new java.util.HashMap<>();
-    /** D16: Opus-cache bound (~16 entries, ~3 MB for both stems).
-     *  Entries are evicted oldest-first, preferring seqs the
-     *  writer already passed; forward playback never reads the
-     *  cache (decode tasks hold their own bytes), so eviction
-     *  only shortens the backward-seek range (~84 s). */
-    private static final int MAX_OPUS_CACHE_ENTRIES = 16;
     private final Object reorderLock = new Object();
-    /** D6: seek generation. Bumped on every backward seekJump
-     *  (which nulls currentChunk and clears the queues) so the
-     *  write loop can re-validate its chunk under reorderLock
-     *  and abandon a stale pre-seek chunk instead of playing it.
-     *  Forward skips trim the chunk in place (same identity),
-     *  so they do not bump this. Guarded by reorderLock. */
-    private int seekGeneration = 0;
     /** Live BV mix switch, read per write block (instant). */
     private volatile boolean backingVocalsEnabled;
+
+    /** Pitch-only key-change stage (null until start()). */
+    private volatile KaraokeKeyShifter keyShifter;
+    /** Key chosen before the player exists (applied in start()). */
+    private volatile int pendingSemitones = 0;
     private int nextExpectedSeq = 0;
     private long reorderWaitStartMs = -1;
     /** v41: true once the server finished (done) or the socket
-     *  closed. Only then may a missing chunk be skipped, and only
-     *  to the first AVAILABLE chunk; while the stream is alive
-     *  the writer waits for the exact nextExpectedSeq (a hole
-     *  breaks sync forever, silence just pauses it). D4: an empty
-     *  queue is never skipped past, however long the stall — the
-     *  missing chunk may still arrive. */
+     *  closed. Only then may a missing chunk be skipped; while
+     *  the stream is alive the writer waits (a hole breaks sync
+     *  forever, silence just pauses it). 30s backstop bounds a
+     *  silent stall. */
     private volatile boolean streamDone = false;
     private static final long STREAM_ALIVE_WAIT_MS = 30_000;
 
@@ -170,9 +160,6 @@ public class KaraokePlayer {
     private long trackStartHeadFrames;
 
     private volatile int queuedChunks;
-    /** D6: frames of taken (not merely queued) PCM. NOT atomic
-     *  as a bare volatile long across read-modify-write: every
-     *  mutation and every read is guarded by reorderLock. */
     private volatile long bufferedFrames;
     /** Last setSpeedFactor value, for change-only logs. */
     private volatile float lastSpeedFactor = 1.0f;
@@ -211,17 +198,6 @@ public class KaraokePlayer {
      *  before start(): tasks run once the threads start. */
     public void queueChunk(String stream, int seq, long startSamples,
             int sampleRate, byte[] opusOggBytes) {
-        // D8: validate at intake — a bad chunk is dropped and
-        // logged, never a session-fatal error.
-        if (seq < 0 || startSamples < 0 || sampleRate <= 0
-                || opusOggBytes == null) {
-            KaraokeLog.w("player: dropping invalid chunk stream=" + stream
-                    + " seq=" + seq + " start=" + startSamples
-                    + " sampleRate=" + sampleRate
-                    + " bytes=" + (opusOggBytes == null
-                            ? "null" : opusOggBytes.length));
-            return;
-        }
         final boolean isBacking = "backing".equals(stream);
         // v54: cache raw bytes for instant backward seeks
         // (cheap ref hold on the WS reader thread; the decode
@@ -236,25 +212,6 @@ public class KaraokePlayer {
                 cached.backing = opusOggBytes;
             } else {
                 cached.instrumental = opusOggBytes;
-            }
-            // D16: bound the cache. Evict the oldest entries
-            // first, preferring seqs the writer already passed.
-            while (opusCache.size() > MAX_OPUS_CACHE_ENTRIES) {
-                Integer evict = null;
-                for (Integer k : opusCache.keySet()) {
-                    if (k < nextExpectedSeq
-                            && (evict == null || k < evict)) {
-                        evict = k;
-                    }
-                }
-                if (evict == null) {
-                    for (Integer k : opusCache.keySet()) {
-                        if (evict == null || k < evict) evict = k;
-                    }
-                }
-                if (evict == null) break;
-                opusCache.remove(evict);
-                KaraokeLog.d("player: opusCache evicted seq=" + evict);
             }
         }
         Runnable task = () -> {
@@ -372,93 +329,80 @@ public class KaraokePlayer {
         return backingVocalsEnabled;
     }
 
+    // ---- key change (instrumental transposition) ----
+
+    /**
+     * Shift the instrumental pitch by {@code semitones}, keeping
+     * tempo. 0 = original key (DSP fully bypassed). Safe to call
+     * live: the shift takes effect within one block (~85 ms) and the
+     * sample count never changes, so sync and chunk tiling are
+     * untouched. See KaraokeKeyShifter and docs/KEYCHANGE.md.
+     */
+    public void setKeySemitones(int semitones) {
+        KaraokeKeyShifter ks = keyShifter;
+        if (ks == null) {
+            pendingSemitones = semitones;
+            return;
+        }
+        ks.setSemitones(semitones);
+    }
+
+    public int getKeySemitones() {
+        KaraokeKeyShifter ks = keyShifter;
+        return ks == null ? pendingSemitones : ks.getSemitones();
+    }
+
+    /** Diagnostics: DSP faults so far (0 = healthy). */
+    public long getKeyFailures() {
+        KaraokeKeyShifter ks = keyShifter;
+        return ks == null ? 0 : ks.getFailures();
+    }
+
     /** Creates the track and threads. The track plays silence until
-     *  releaseHold() is called (see class doc). D7: the track is
-     *  built and proven playable BEFORE running is claimed or any
-     *  thread starts — a failed build used to leave running=true
-     *  with no threads, poisoning the player so a retry no-opped. */
+     *  releaseHold() is called (see class doc). */
     public void start() {
-        if (running.get()) return;
-        AudioTrack newTrack;
-        int minBuf;
-        try {
-            minBuf = AudioTrack.getMinBufferSize(OUT_RATE,
-                    AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT);
-            newTrack = new AudioTrack.Builder()
-                    .setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build())
-                    .setAudioFormat(new AudioFormat.Builder()
-                            .setSampleRate(OUT_RATE)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .build())
-                    // v44: ~0.36s track buffer, not 1.0s — the big
-                    // buffer delayed speaker output (constant drift)
-                    // and made seeks play out stale audio first.
-                    .setBufferSizeInBytes(Math.max(minBuf * 3, OUT_RATE))
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build();
-            if (newTrack == null
-                    || newTrack.getState()
-                            != AudioTrack.STATE_INITIALIZED) {
-                int state = newTrack == null
-                        ? -1 : newTrack.getState();
-                if (newTrack != null) {
-                    try {
-                        newTrack.release();
-                    } catch (Exception ignored) {
-                    }
-                }
-                playerError("player: AudioTrack not initialized (state="
-                        + state + ")",
-                        new IllegalStateException(
-                                "AudioTrack state=" + state));
-                return;
-            }
-            try {
-                newTrack.setVolume(1.0f);
-            } catch (Exception e) {
-                KaraokeLog.w("player: setVolume(1.0) failed", e);
-            }
-            try {
-                newTrack.play();
-            } catch (Exception e) {
-                try {
-                    newTrack.release();
-                } catch (Exception ignored) {
-                }
-                playerError("player: AudioTrack.play() failed", e);
-                return;
-            }
-        } catch (Exception e) {
-            playerError("player: AudioTrack creation failed", e);
-            return;
-        }
-        // Claim running only now that the track plays; a racing
-        // start() releases the spare track instead of stealing it.
-        if (!running.compareAndSet(false, true)) {
-            try {
-                newTrack.release();
-            } catch (Exception ignored) {
-            }
-            return;
-        }
-        track = newTrack;
+        if (running.getAndSet(true)) return;
+        // Pitch-only key-change stage. Created before the writer
+        // thread starts so the first block already sees it.
+        keyShifter = new KaraokeKeyShifter(OUT_RATE, 2);
+        keyShifter.setSemitones(pendingSemitones);
+        int minBuf = AudioTrack.getMinBufferSize(OUT_RATE,
+                AudioFormat.CHANNEL_OUT_STEREO,
+                AudioFormat.ENCODING_PCM_16BIT);
+        track = new AudioTrack.Builder()
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build())
+                .setAudioFormat(new AudioFormat.Builder()
+                        .setSampleRate(OUT_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build())
+                // v44: ~0.36s track buffer, not 1.0s — the big
+                // buffer delayed speaker output (constant drift)
+                // and made seeks play out stale audio first.
+                .setBufferSizeInBytes(Math.max(minBuf * 3, OUT_RATE))
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build();
         basePlayedFrames = 0;
         trackStartHeadFrames = 0;
+        try {
+            track.setVolume(1.0f);
+        } catch (Exception e) {
+            KaraokeLog.w("player: setVolume(1.0) failed", e);
+        }
+        track.play();
         KaraokeLog.i("player: AudioTrack created rate=" + OUT_RATE
                 + " minBuf=" + minBuf + " bufferBytes="
                 + Math.max(minBuf * 3, OUT_RATE)
                 + " state=" + track.getState()
                 + " playState=" + track.getPlayState()
                 + " (playing-held until hold release)");
-        decodeThread = new Thread(() -> decodeLoop(decodeTasks, false),
+        decodeThread = new Thread(() -> decodeLoop(decodeTasks),
                 "karaoke-decode");
         backingDecodeThread = new Thread(
-                () -> decodeLoop(backingDecodeTasks, true),
+                () -> decodeLoop(backingDecodeTasks),
                 "karaoke-decode-bv");
         writeThread = new Thread(this::writeLoop, "karaoke-write");
         decodeThread.start();
@@ -531,9 +475,7 @@ public class KaraokePlayer {
 
     /** Seconds of decoded PCM queued ahead of the play head. */
     public double bufferedSec() {
-        synchronized (reorderLock) {
-            return bufferedFrames / (double) OUT_RATE;
-        }
+        return bufferedFrames / (double) OUT_RATE;
     }
 
     /** Seconds of decoded PCM waiting in the reorder queue
@@ -768,10 +710,6 @@ public class KaraokePlayer {
             nextExpectedSeq = targetSeq;
             reorderWaitStartMs = -1;
             playheadFloorSec = targetSec;
-            // D6: invalidate any chunk the write loop already
-            // holds — it must re-validate under the lock and
-            // abandon the stale chunk instead of playing it.
-            seekGeneration++;
             reorderLock.notifyAll();
         }
         if (track != null) {
@@ -816,6 +754,43 @@ public class KaraokePlayer {
                 + " (requeued " + requeued + " cached chunks)");
     }
 
+    /** End (seconds, song timeline) of the furthest decoded
+     *  karaoke audio currently held — the vocal-removed
+     *  "buffered" extent the seek bar shows light blue while
+     *  karaoke is active. -1 when nothing is decoded yet. */
+    public double coverageEndSec() {
+        synchronized (reorderLock) {
+            double end = -1;
+            PcmChunk cur = currentChunk;
+            if (cur != null) end = Math.max(end, cur.endSec());
+            for (PcmChunk c : reorder.values()) {
+                end = Math.max(end, c.endSec());
+            }
+            return end;
+        }
+    }
+
+    /** Whole instant-karaoke range {startSec, endSec} from the
+     *  Opus cache (v54): every cached chunk re-decodes in ~0.5s,
+     *  so this whole span is "instant" on the seek bar —
+     *  including the already-played part behind the playhead.
+     *  Null when nothing is cached yet. */
+    public double[] cachedCoverageSec() {
+        synchronized (reorderLock) {
+            if (opusCache.isEmpty()) return null;
+            double start = Double.MAX_VALUE;
+            double end = -1;
+            for (CachedOpus co : opusCache.values()) {
+                if (co.instrumental == null) continue;
+                double s = co.startSamples / (double) co.sampleRate;
+                start = Math.min(start, s);
+                end = Math.max(end, s + 5.25);
+            }
+            if (end < 0) return null;
+            return new double[] {start, end};
+        }
+    }
+
     /** True when nothing is left to play (v30 song-end check). */
     public boolean isDrained() {
         synchronized (reorderLock) {
@@ -825,122 +800,41 @@ public class KaraokePlayer {
         }
     }
 
-    /** Full reset: interrupts and joins the three threads
-     *  (bounded), drains both decode queues, releases the track,
-     *  and restores every player field to its initial value, so
-     *  the player is safe to start() again for the next song
-     *  (D5 — the old stop() only interrupted, never reset or
-     *  joined, so a reused player kept stale held/paused/seq
-     *  state and orphaned threads). */
     public void stop() {
-        KaraokeLog.i("player: stop (full reset)");
+        KaraokeLog.i("player: stop (threads interrupted, track released)");
+        // Remember the key so a restart keeps it, then drop the DSP
+        // state (a new session primes a fresh shifter).
+        pendingSemitones = getKeySemitones();
+        keyShifter = null;
         running.set(false);
-        Thread dt = decodeThread;
-        Thread bdt = backingDecodeThread;
-        Thread wt = writeThread;
-        if (dt != null) dt.interrupt();
-        if (bdt != null) bdt.interrupt();
-        if (wt != null) wt.interrupt();
-        // Drain queued decode work so a later start() cannot run
-        // stale tasks for the previous song.
-        decodeTasks.clear();
-        backingDecodeTasks.clear();
+        if (decodeThread != null) decodeThread.interrupt();
+        if (backingDecodeThread != null) backingDecodeThread.interrupt();
+        if (writeThread != null) writeThread.interrupt();
+        bufferedFrames = 0;
         synchronized (reorderLock) {
             reorder.clear();
             backingReorder.clear();
             opusCache.clear();
-            bufferedFrames = 0;
-            queuedChunks = 0;
-            nextExpectedSeq = 0;
-            streamDone = false;
-            playheadFloorSec = -1;
-            currentChunk = null;
-            reorderWaitStartMs = -1;
-            // Invalidate any chunk a dying write iteration holds.
-            seekGeneration++;
             reorderLock.notifyAll();
         }
-        held = true;
-        paused = false;
-        basePlayedFrames = 0;
-        trackStartHeadFrames = 0;
-        writeDiagBlocks = 0;
-        writeDiagFrames = 0;
-        lastSpeedFactor = 1.0f;
-        joinQuietly(dt, 2000);
-        joinQuietly(bdt, 2000);
-        joinQuietly(wt, 2000);
-        decodeThread = null;
-        backingDecodeThread = null;
-        writeThread = null;
-        // Null the track under the same lock the write loop
-        // snapshots it under, so it can never write to a
-        // released track.
-        AudioTrack t;
-        synchronized (reorderLock) {
-            t = track;
-            track = null;
-        }
-        if (t != null) {
+        currentChunk = null;
+        if (track != null) {
             try {
-                t.stop();
+                track.stop();
             } catch (IllegalStateException e) {
                 KaraokeLog.w("player: track.stop() failed", e);
-            } catch (Exception e) {
-                KaraokeLog.w("player: track.stop() failed", e);
             }
-            try {
-                t.release();
-            } catch (Exception e) {
-                KaraokeLog.w("player: track.release() failed", e);
-            }
+            track.release();
+            track = null;
         }
     }
 
-    /** Bounded join: never hangs stop() on a stuck thread, and
-     *  never joins the calling thread itself. */
-    private static void joinQuietly(Thread t, long timeoutMs) {
-        if (t == null || t == Thread.currentThread()) return;
-        try {
-            t.join(timeoutMs);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        if (t.isAlive()) {
-            KaraokeLog.w("player: stop: thread " + t.getName()
-                    + " did not exit in " + timeoutMs + "ms");
-        }
-    }
-
-    /** D16: decode-ahead backpressure — at ~15x real-time the
-     *  decoders would otherwise turn a whole song into PCM
-     *  (~1 MB/chunk x 2 stems) while the writer is held/paused.
-     *  A lane pauses (without taking work) while more than
-     *  MAX_DECODE_AHEAD chunks sit decoded ahead of the writer. */
-    private static final int MAX_DECODE_AHEAD = 10;
-
-    private void decodeLoop(BlockingQueue<Runnable> queue,
-            boolean isBacking) {
+    private void decodeLoop(BlockingQueue<Runnable> queue) {
         while (running.get()) {
             try {
-                synchronized (reorderLock) {
-                    while (running.get()
-                            && (isBacking ? backingReorder.size()
-                                    : reorder.size()) > MAX_DECODE_AHEAD) {
-                        reorderLock.wait(100);
-                    }
-                }
-                if (!running.get()) return;
                 Runnable t = queue.take();
                 t.run();
             } catch (InterruptedException e) {
-                return;
-            } catch (Throwable t) {
-                // D14: an Error (e.g. OOM) used to kill the thread
-                // silently; report it and return like any fatal
-                // decode failure. Suppressed while stopping.
-                if (!running.get()) return;
-                playerError("decode loop failed", t);
                 return;
             }
         }
@@ -953,52 +847,12 @@ public class KaraokePlayer {
                     Thread.sleep(20);
                     continue;
                 }
-                // Take the next chunk if needed. D6: a backward
-                // seek landing mid-take must not install a stale
-                // chunk over the seek's null — capture the seek
-                // generation first, re-check it under the lock
-                // after the take, and drop the chunk if it moved.
-                int genBefore;
-                synchronized (reorderLock) {
-                    genBefore = seekGeneration;
+                if (currentChunk == null || currentChunk.framesLeft() == 0) {
+                    currentChunk = nextChunk();
+                    if (currentChunk == null) continue;
                 }
-                boolean needTake;
-                synchronized (reorderLock) {
-                    needTake = currentChunk == null
-                            || currentChunk.framesLeft() == 0;
-                }
-                if (needTake) {
-                    PcmChunk taken = nextChunk();
-                    if (taken == null) continue;
-                    synchronized (reorderLock) {
-                        if (!running.get()
-                                || seekGeneration != genBefore) {
-                            bufferedFrames -= taken.framesLeft();
-                            if (bufferedFrames < 0) bufferedFrames = 0;
-                            continue;
-                        }
-                        currentChunk = taken;
-                    }
-                }
-                // Snapshot one block under the lock (chunk identity,
-                // generation, and pos), then re-validate after the
-                // copy so a seek landing mid-copy cannot play stale
-                // audio: a stale block is dropped, never written.
-                PcmChunk cur;
-                int pos;
-                int frames;
-                int gen;
-                synchronized (reorderLock) {
-                    cur = currentChunk;
-                    gen = seekGeneration;
-                    if (cur == null) continue;
-                    pos = cur.pos;
-                    frames = Math.min(cur.capFrames - pos, 4096);
-                    if (frames <= 0) {
-                        if (currentChunk == cur) currentChunk = null;
-                        continue;
-                    }
-                }
+                PcmChunk cur = currentChunk;
+                int frames = Math.min(cur.framesLeft(), 4096);
                 short[] buf = new short[frames * 2];
                 // Live BV mix: instrumental + backing (gain 1.0
                 // preserves the stems' original mix balance;
@@ -1015,11 +869,11 @@ public class KaraokePlayer {
                 boolean mixBacking = backingVocalsEnabled
                         && backing != null;
                 if (!mixBacking) {
-                    System.arraycopy(cur.pcm, pos * 2,
+                    System.arraycopy(cur.pcm, cur.pos * 2,
                             buf, 0, frames * 2);
                 } else {
                     for (int frame = 0; frame < frames; frame++) {
-                        int srcFrame = pos + frame;
+                        int srcFrame = cur.pos + frame;
                         int src = srcFrame * 2;
                         int dst = frame * 2;
                         int left = cur.pcm[src];
@@ -1035,41 +889,14 @@ public class KaraokePlayer {
                                 Math.min(32767, right));
                     }
                 }
-                boolean stale;
-                synchronized (reorderLock) {
-                    stale = currentChunk != cur
-                            || seekGeneration != gen
-                            || cur.pos != pos;
-                }
-                if (stale) continue;
-                // Polish: snapshot the track under the same lock
-                // stop() nulls it under, and check write()'s
-                // return (a negative result means the track is
-                // dead — fail loudly instead of spinning silent).
-                AudioTrack t;
-                synchronized (reorderLock) {
-                    t = track;
-                }
-                if (t == null) return; // stopped
-                int written = t.write(buf, 0, buf.length);
-                if (written < 0) {
-                    playerError("player: AudioTrack.write failed: "
-                            + written,
-                            new IllegalStateException(
-                                    "AudioTrack.write=" + written));
-                    return;
-                }
-                synchronized (reorderLock) {
-                    // Advance only if no seek repositioned the
-                    // chunk since the snapshot; otherwise the
-                    // seek owns pos and this block is already
-                    // accounted for by the seek's adjustment.
-                    if (currentChunk == cur && cur.pos == pos) {
-                        cur.pos += frames;
-                    }
-                    bufferedFrames -= frames;
-                    if (bufferedFrames < 0) bufferedFrames = 0;
-                }
+                cur.pos += frames;
+                // Key change: pitch-only, same sample count. Last
+                // DSP step, immediately before the speaker, so the
+                // BV mix above is shifted as one signal.
+                KaraokeKeyShifter ks = keyShifter;
+                if (ks != null) ks.process(buf, buf.length);
+                track.write(buf, 0, buf.length);
+                bufferedFrames -= frames;
                 // v52 diagnosis: prove the writer reaches the
                 // speaker (head advance + underruns + PCM level).
                 // One I-line per ~5s; cheap sampled RMS.
@@ -1087,8 +914,8 @@ public class KaraokePlayer {
                                 ? (int) Math.sqrt(wSum / wN) : 0;
                         KaraokeLog.i("player: writer alive frames="
                                 + writeDiagFrames + " head="
-                                + t.getPlaybackHeadPosition()
-                                + " underruns=" + t.getUnderrunCount()
+                                + track.getPlaybackHeadPosition()
+                                + " underruns=" + track.getUnderrunCount()
                                 + " blockRms=" + wRms
                                 + " bv=" + backingVocalsEnabled);
                     } catch (Exception e) {
@@ -1097,15 +924,10 @@ public class KaraokePlayer {
                 }
             } catch (InterruptedException e) {
                 return;
-            } catch (Throwable e) {
-                // D14: an Error (e.g. OOM) used to kill the writer
-                // silently. Suppressed while stopping, so a track
-                // released under a dying iteration is not reported
-                // as a failure.
-                if (!running.get()) return;
-                synchronized (reorderLock) {
-                    currentChunk = null;
-                }
+            } catch (Exception e) {
+                // The writer thread died: log with the trace and
+                // fail the session instead of spinning silently.
+                currentChunk = null;
                 playerError("write loop failed", e);
                 return;
             }
@@ -1115,10 +937,6 @@ public class KaraokePlayer {
     private void trimChunk(PcmChunk c) {
         // Nominal 5.25 s unless the successor's start is already
         // known (chunks arrive ~15x real-time, so it usually is).
-        // D8: clamp to [0, pcm.length/2] — a successor start at or
-        // before this chunk's start used to make capFrames
-        // negative, and the write loop then allocated a negative-
-        // sized array. A zero-length trim is dropped by nextChunk().
         int nominal = NOMINAL_CHUNK_SAMPLES_48K;
         synchronized (reorderLock) {
             PcmChunk next = reorder.get(c.seq + 1);
@@ -1127,8 +945,6 @@ public class KaraokePlayer {
                         (next.startSec - c.startSec) * OUT_RATE);
             }
         }
-        nominal = Math.max(0,
-                Math.min(nominal, c.pcm.length / 2));
         if (c.pcm.length / 2 > nominal) {
             c.capFrames = nominal;
         }
@@ -1170,7 +986,16 @@ public class KaraokePlayer {
         synchronized (reorderLock) {
             while (running.get()) {
                 PcmChunk c = null;
-                if (reorder.containsKey(nextExpectedSeq)) {
+                if (nextExpectedSeq == Integer.MAX_VALUE) {
+                    // Post-seek fallback path (unused after the
+                    // skipToSec redesign; kept for safety).
+                    if (!reorder.isEmpty()) {
+                        Integer first = reorder.firstKey();
+                        c = reorder.remove(first);
+                        nextExpectedSeq = first + 1;
+                        queuedChunks--;
+                    }
+                } else if (reorder.containsKey(nextExpectedSeq)) {
                     PcmChunk inst = reorder.get(nextExpectedSeq);
                     PcmChunk backing = backingReorder.get(nextExpectedSeq);
                     if (inst.backingPcm == null && backing != null) {
@@ -1199,12 +1024,9 @@ public class KaraokePlayer {
                         // N x 30s of silence before (each +1 waited
                         // out the full backstop again); the hole is
                         // skipped either way and the drift loop heals
-                        // it, so skip it at once. D4: an EMPTY queue
-                        // is NEVER skipped past — the next chunk is
-                        // genuinely in flight and may still arrive;
-                        // stepping +1 here dropped it as stale on
-                        // arrival and waited another 30s. Just log
-                        // the stall and keep waiting for the same seq.
+                        // it, so skip it at once. An EMPTY queue means
+                        // the next chunk is genuinely in flight, so
+                        // only then step +1 and keep waiting.
                         if (!reorder.isEmpty()) {
                             int first = reorder.firstKey();
                             KaraokeLog.w("player: chunk gap, jumping "
@@ -1213,10 +1035,12 @@ public class KaraokePlayer {
                                             : " (stream alive)"));
                             nextExpectedSeq = first;
                         } else {
-                            KaraokeLog.w("player: still waiting for "
+                            KaraokeLog.w("player: chunk gap, waiting for "
                                     + "in-flight seq=" + nextExpectedSeq
-                                    + (streamDone ? " (stream done)"
-                                            : " (stream alive)"));
+                                    + (streamDone ? ""
+                                            : " (stream alive,"
+                                            + " 30s backstop)"));
+                            nextExpectedSeq++;
                         }
                         reorderWaitStartMs = -1;
                         continue;
@@ -1226,11 +1050,6 @@ public class KaraokePlayer {
                     // Trim to the successor's start when known, so
                     // boundaries land exactly on server starts.
                     trimChunk(c);
-                    // D8: a zero-length trim (successor start at or
-                    // before this chunk's start) is dropped, not played.
-                    if (c.framesLeft() <= 0) {
-                        continue;
-                    }
                     if (!applyFloor(c)) {
                         continue; // fully before the floor: next chunk
                     }
@@ -1328,40 +1147,9 @@ public class KaraokePlayer {
                         // Logging must never break decode.
                     }
                 }
-                // D12: bounded retry on the input buffer — a single
-                // 10 ms timeout used to drop the packet silently
-                // (and stall pts). Up to 3 attempts; only then is
-                // the packet skipped, with pts still advanced so
-                // the timeline stays aligned, and a warning logged.
-                int inIdx = -1;
-                for (int attempt = 0; attempt < 3; attempt++) {
-                    inIdx = codec.dequeueInputBuffer(10_000);
-                    if (inIdx >= 0) break;
-                    inputTimeouts++;
-                    try {
-                        Thread.sleep(2);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw e;
-                    }
-                }
+                int inIdx = codec.dequeueInputBuffer(10_000);
                 if (inIdx >= 0) {
                     ByteBuffer inBuf = codec.getInputBuffer(inIdx);
-                    // D12: never trust the buffer — a null or
-                    // undersized input buffer used to throw
-                    // BufferOverflowException, which queueChunk
-                    // turned into a session-fatal playerError.
-                    // An oversized packet skips just this chunk.
-                    if (inBuf == null
-                            || inBuf.capacity() < packet.length) {
-                        KaraokeLog.w("player: chunk seq=" + seq
-                                + " packet too large for input buffer"
-                                + " (len=" + packet.length
-                                + ", cap=" + (inBuf == null
-                                        ? -1 : inBuf.capacity())
-                                + "), skipping chunk");
-                        return new short[0];
-                    }
                     inBuf.clear();
                     inBuf.put(packet);
                     codec.queueInputBuffer(inIdx, 0, packet.length,
@@ -1369,10 +1157,7 @@ public class KaraokePlayer {
                     ptsUs += 20_000; // Opus frames are 20 ms
                     packetsFed++;
                 } else {
-                    KaraokeLog.w("player: chunk seq=" + seq
-                            + " no input buffer after 3 attempts,"
-                            + " dropping one packet");
-                    ptsUs += 20_000; // keep the timeline aligned
+                    inputTimeouts++;
                 }
                 // v53: NON-BLOCKING mid-feed drain. The old 10ms
                 // timeout waited the full 10ms after ~every one of
@@ -1407,24 +1192,13 @@ public class KaraokePlayer {
             }
         } finally {
             if (codec != null) {
-                // D14: release() runs in its own try/catch so it
-                // always runs, even if stop() throws a
-                // non-IllegalStateException RuntimeException.
                 try {
                     codec.stop();
                 } catch (IllegalStateException e) {
                     KaraokeLog.w("player: decoder stop failed for chunk "
                             + "seq=" + seq, e);
-                } catch (RuntimeException e) {
-                    KaraokeLog.w("player: decoder stop failed for chunk "
-                            + "seq=" + seq, e);
                 }
-                try {
-                    codec.release();
-                } catch (Exception e) {
-                    KaraokeLog.w("player: decoder release failed for chunk "
-                            + "seq=" + seq, e);
-                }
+                codec.release();
             }
         }
         byte[] raw = pcmOut.toByteArray();
@@ -1463,12 +1237,6 @@ public class KaraokePlayer {
             int outIdx = codec.dequeueOutputBuffer(info, timeoutUs);
             if (outIdx >= 0) {
                 ByteBuffer buf = codec.getOutputBuffer(outIdx);
-                // D12: a null output buffer used to NPE here and
-                // fail the whole session; release and skip it.
-                if (buf == null) {
-                    codec.releaseOutputBuffer(outIdx, false);
-                    continue;
-                }
                 byte[] tmp = new byte[info.size];
                 buf.get(tmp);
                 out.write(tmp, 0, tmp.length);
@@ -1500,12 +1268,6 @@ public class KaraokePlayer {
             int outIdx = codec.dequeueOutputBuffer(info, 2_000);
             if (outIdx >= 0) {
                 ByteBuffer buf = codec.getOutputBuffer(outIdx);
-                // D12: see drainCodec — never dereference a null
-                // output buffer; release and keep polling.
-                if (buf == null) {
-                    codec.releaseOutputBuffer(outIdx, false);
-                    continue;
-                }
                 byte[] tmp = new byte[info.size];
                 buf.get(tmp);
                 out.write(tmp, 0, tmp.length);

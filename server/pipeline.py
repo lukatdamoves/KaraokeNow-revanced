@@ -229,3 +229,130 @@ def decode_opus(data: bytes) -> np.ndarray:
 
 def cache_key(video_id: str, model_name: str) -> str:
     return f"{video_id}:{model_name}"
+
+
+# --------------------------------------------------------------------
+# Vocal profile (auto key change, docs/KEYCHANGE.md)
+# --------------------------------------------------------------------
+# The separated vocal stem is already in hand, so measuring the song's
+# vocal tessitura costs no extra GPU: this is pure numpy on a mono
+# downmix. YIN is implemented here rather than pulling librosa, which
+# would drag numba+llvmlite into the Modal image for one function.
+#
+# Everything is reported in CENTS (A1 = 55 Hz = 0) so the phone can
+# compare its own measurement directly, and the shift is chosen as
+# song_centre - singer_centre.
+
+PROFILE_RATE = 16000
+PROFILE_FRAME = 2048
+PROFILE_HOP = 320
+PROFILE_MIN_HZ = 65.0
+PROFILE_MAX_HZ = 1000.0
+YIN_THRESHOLD = 0.15
+PROFILE_RMS_GATE = 0.0055
+# Enough of the song to judge a tessitura. Chunks arrive in 5.25 s
+# steps, so this is ~9 windows and lands well before a user has
+# finished a first chorus.
+PROFILE_MIN_SECONDS = 45.0
+
+
+def hz_to_cents(hz: float) -> float:
+    return 1200.0 * float(np.log2(hz / 55.0))
+
+
+def _mono(pcm: np.ndarray) -> np.ndarray:
+    if pcm.ndim > 1:
+        return pcm.mean(axis=0)
+    return pcm
+
+
+def _downsample(x: np.ndarray, sr: int, target: int) -> np.ndarray:
+    if sr == target:
+        return x
+    factor = int(round(sr / target))
+    if factor <= 1:
+        return x
+    n = len(x) // factor * factor
+    return x[:n].reshape(-1, factor).mean(axis=1)
+
+
+def _yin_f0(frame: np.ndarray, sr: int) -> float:
+    """YIN f0 for one frame, or 0.0 when unvoiced."""
+    min_lag = int(sr / PROFILE_MAX_HZ)
+    max_lag = min(int(sr / PROFILE_MIN_HZ), len(frame) // 2)
+    if max_lag <= min_lag:
+        return 0.0
+    w = len(frame) - max_lag
+    if w <= 0:
+        return 0.0
+    lags = np.arange(min_lag, max_lag + 1)
+    # difference function, vectorised over lags
+    d = np.empty(len(lags), dtype=np.float64)
+    for i, lag in enumerate(lags):
+        diff = frame[:w] - frame[lag:lag + w]
+        d[i] = float(np.dot(diff, diff))
+    # cumulative mean normalised difference
+    running = np.cumsum(d)
+    cmnd = np.ones_like(d)
+    idx = np.arange(1, len(d))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cmnd[idx] = np.where(running[idx] > 0,
+                             d[idx] * lags[idx] / running[idx], 1.0)
+    below = np.nonzero(cmnd < YIN_THRESHOLD)[0]
+    if len(below):
+        i = int(below[0])
+        while i + 1 < len(cmnd) and cmnd[i + 1] < cmnd[i]:
+            i += 1
+    else:
+        i = int(np.argmin(cmnd))
+        if cmnd[i] > 0.4:
+            return 0.0
+    refined = float(lags[i])
+    if 0 < i < len(cmnd) - 1:
+        a, b, c = cmnd[i - 1], cmnd[i], cmnd[i + 1]
+        denom = 2.0 * (2.0 * b - a - c)
+        if denom != 0:
+            refined += (c - a) / denom
+    if refined <= 0:
+        return 0.0
+    hz = sr / refined
+    return hz if PROFILE_MIN_HZ <= hz <= PROFILE_MAX_HZ else 0.0
+
+
+def vocal_profile(pcm: np.ndarray, sr: int = SAMPLE_RATE) -> dict | None:
+    """Song vocal tessitura from a vocal stem window set.
+
+    `pcm` is float32 (channels, samples) at `sr`. Returns None when
+    there is not enough pitched material to be honest about it.
+    """
+    x = _downsample(_mono(pcm).astype(np.float64), sr, PROFILE_RATE)
+    if len(x) < PROFILE_FRAME:
+        return None
+    cents = []
+    for start in range(0, len(x) - PROFILE_FRAME + 1, PROFILE_HOP):
+        frame = x[start:start + PROFILE_FRAME]
+        rms = float(np.sqrt(np.mean(frame * frame)))
+        if rms < PROFILE_RMS_GATE:
+            continue
+        hz = _yin_f0(frame, PROFILE_RATE)
+        if hz > 0:
+            cents.append(hz_to_cents(hz))
+    if len(cents) < 40:
+        return None
+    arr = np.array(cents)
+    # drop octave slips against the median, once
+    med = float(np.median(arr))
+    arr = arr[np.abs(arr - med) <= 1400.0]
+    if len(arr) < 40:
+        return None
+    p05, p25, p75, p95 = (float(np.percentile(arr, q)) for q in (5, 25, 75, 95))
+    return {
+        "version": 1,
+        "center_cents": (p25 + p75) / 2.0,
+        "p05_cents": p05,
+        "p95_cents": p95,
+        "p25_cents": p25,
+        "p75_cents": p75,
+        "voiced_frames": int(len(arr)),
+        "voiced_ratio": round(float(len(cents) / max(1, len(x) // PROFILE_HOP)), 3),
+    }
