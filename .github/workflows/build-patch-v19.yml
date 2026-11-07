@@ -68,8 +68,14 @@ jobs:
       - name: Install pinned SDK packages (API 35, build-tools 35.0.0)
         run: |
           set -e
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager --install --sdk_root="$ANDROID_HOME" \
+          # sdkmanager is NOT on PATH without setup-android; find the
+          # runner's cmdline-tools copy by absolute path.
+          SDKMANAGER="$(find /usr/local/lib/android/sdk/cmdline-tools "$ANDROID_HOME/cmdline-tools" \
+            -name sdkmanager -type f 2>/dev/null | head -n 1)"
+          test -n "$SDKMANAGER" || { echo "sdkmanager not found on the runner"; exit 1; }
+          echo "sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install --sdk_root="$ANDROID_HOME" \
             "platforms;android-35" "build-tools;35.0.0"
           ANDROID_JAR="$ANDROID_HOME/platforms/android-35/android.jar"
           D8="$ANDROID_HOME/build-tools/35.0.0/d8"
