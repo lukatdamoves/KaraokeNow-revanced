@@ -60,12 +60,17 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Install Android SDK (API 35, pinned)
-        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
-      - name: Install pinned SDK packages
+      # NOTE: android-actions/setup-android no longer installs the
+      # legacy `tools` package (Google removed it from the SDK repo,
+      # 2026-11: "Warning: Failed to find package 'tools'" then a hard
+      # sdkmanager exit 1). The runner image already ships cmdline-tools
+      # and sdkmanager, so we install only the pinned packages we use.
+      - name: Install pinned SDK packages (API 35, build-tools 35.0.0)
         run: |
           set -e
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install --sdk_root="$ANDROID_HOME" \
+            "platforms;android-35" "build-tools;35.0.0"
           ANDROID_JAR="$ANDROID_HOME/platforms/android-35/android.jar"
           D8="$ANDROID_HOME/build-tools/35.0.0/d8"
           DEXDUMP="$ANDROID_HOME/build-tools/35.0.0/dexdump"
